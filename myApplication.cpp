@@ -36,6 +36,14 @@ const char* imageFileNames[7] = { "AllBalls.jpeg", "Table1.jpeg", "Table2.jpeg",
                                   "Table4.jpeg", "Table5.jpeg", "Table6.jpeg" };
 const char* imageNames[7] = { "AllBalls", "Table1", "Table2", "Table3", "Table4", "Table5", "Table6" };
 
+// Middle value of a list, which reorders list
+double medianValue(vector<float>& values) {
+    if (values.empty()) return 0;
+    size_t middle = values.size() / 2;
+    nth_element(values.begin(), values.begin() + middle, values.end());
+    return values[middle];
+}
+
 Point2f applyHomography(const Mat& homography, Point2f point) {
     vector<Point2f> points = { point }, transformed;
     perspectiveTransform(points, transformed, homography);
@@ -74,16 +82,19 @@ Geometry buildGeometry(Size imageSize) {
     return geometry;
 }
 
+// First attempt, the cloth is whatever is roughly this green
+Mat clothMask(const Mat& image) {
+    Mat hsvImage, mask;
+    cvtColor(image, hsvImage, COLOR_BGR2HSV);
+    inRange(hsvImage, Scalar(50, 40, 40), Scalar(70, 255, 255), mask);
+    return mask;
+}
+
 }
 
 void MyApplication() {
     utils::fs::createDirectories(outputFolder);
     Mat image = loadImage(imageFileNames[0]);
     if (image.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    Geometry geometry = buildGeometry(image.size());
-    Mat flattened;
-    warpPerspective(image, flattened, geometry.imageToTable, Size(tableColumns, tableRows));
-    imwrite(outputFolder + "/flattened.png", flattened);
-    imshow("flattened", flattened);
-    waitKey(0);
+    imwrite(outputFolder + "/cloth.png", clothMask(image));
 }
