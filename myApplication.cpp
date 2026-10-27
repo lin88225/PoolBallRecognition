@@ -30,7 +30,7 @@ const bool showWindows = true;
 const string outputFolder = "output";
 
 const Point2f imageCorners[4] = { Point2f(337, 35), Point2f(38, 472), Point2f(1570, 21), Point2f(1888, 451) };
-const Point2f tableCorners[4] = { Point2f(0, 0), Point2f(tableColumns - 1, 0), Point2f(0, tableRows - 1), Point2f(tableColumns - 1, tableRows - 1) };
+const Point2f tableCorners[4] = { Point2f(0, 0), Point2f(0, tableRows - 1), Point2f(tableColumns - 1, 0), Point2f(tableColumns - 1, tableRows - 1) };
 
 const char* imageFileNames[7] = { "AllBalls.jpeg", "Table1.jpeg", "Table2.jpeg", "Table3.jpeg",
                                   "Table4.jpeg", "Table5.jpeg", "Table6.jpeg" };
