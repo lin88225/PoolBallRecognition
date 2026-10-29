@@ -50,6 +50,15 @@ const float saturationStartHalfWidth = 40.f;
 const double outlierCutOffInDeviations = 3.0;
 const int meanAndDeviationIterations = 6;
 
+const double edgeSmoothingSigma = 1.2;
+const double edgeThresholdMedianMultiple = 5.0;
+const double minimumEdgeThreshold = 4.0;
+const double cannyLowThresholdFraction = 0.5;
+const int voteRadiusCount = 5;
+const double smallestVoteRadiusFraction = 0.88;
+const double largestVoteRadiusFraction = 1.12;
+const double voteSmoothingSigma = 2.0;
+
 const char* imageFileNames[7] = { "AllBalls.jpeg", "Table1.jpeg", "Table2.jpeg", "Table3.jpeg",
                                   "Table4.jpeg", "Table5.jpeg", "Table6.jpeg" };
 const char* imageNames[7] = { "AllBalls", "Table1", "Table2", "Table3", "Table4", "Table5", "Table6" };
@@ -86,17 +95,40 @@ Mat loadImage(const string& fileName) {
 // every image position
 struct Geometry {
     Mat imageToTable, tableToImage;
+    Mat expectedRadius;
 
     Point2f toTable(Point2f point) const { return applyHomography(imageToTable, point); }
     Point2f toImage(Point2f point) const { return applyHomography(tableToImage, point); }
+
+    float radiusAt(Point2f point) const {
+        if (!(point.x == point.x) || !(point.y == point.y)) return expectedRadius.at<float>(0, 0);
+        int column = min(max(cvRound(point.x), 0), expectedRadius.cols - 1);
+        int row = min(max(cvRound(point.y), 0), expectedRadius.rows - 1);
+        return expectedRadius.at<float>(row, column);
+    }
 };
 
-// Finds perspective transformation from four corners
+// Finds perspective transformation from four corners. Expected ball radius at a pixel is
+// Ball radius times image distance covered by one millimetre along table at that point
 Geometry buildGeometry(Size imageSize) {
     Geometry geometry;
     vector<Point2f> imagePoints(imageCorners, imageCorners + 4), tablePoints(tableCorners, tableCorners + 4);
     geometry.imageToTable = getPerspectiveTransform(imagePoints, tablePoints);
     geometry.tableToImage = geometry.imageToTable.inv();
+    geometry.expectedRadius.create(imageSize, CV_32F);
+    vector<Point2f> imageRow(imageSize.width), tableRow, nextImageRow;
+    for (int row = 0; row < imageSize.height; row++) {
+        for (int column = 0; column < imageSize.width; column++) imageRow[column] = Point2f((float)column, (float)row);
+        perspectiveTransform(imageRow, tableRow, geometry.imageToTable);
+        for (Point2f& tablePoint : tableRow) tablePoint.x += 1.f;
+        perspectiveTransform(tableRow, nextImageRow, geometry.tableToImage);
+        float* radiusRow = geometry.expectedRadius.ptr<float>(row);
+        for (int column = 0; column < imageSize.width; column++) {
+            float radius = (float)(ballRadius * norm(nextImageRow[column] - imageRow[column]));
+            if (!(radius > 3.f) || !(radius < 200.f)) radius = 3.f;
+            radiusRow[column] = radius;
+        }
+    }
     return geometry;
 }
 
@@ -210,20 +242,98 @@ Mat clothDistance(const Mat& hsvImage, const ClothModel& cloth) {
     return distanceImage;
 }
 
+struct EdgeImages {
+    Mat edges;
+    Mat gradientX, gradientY;
+    Mat magnitude;
+    float threshold = 0;
+};
+
+// Smooths image and keeps gradient of colour channel that changes most at each pixel.
+// Threshold is a multiple of median gradient and Canny thins edges by non-maxima suppression
+EdgeImages computeEdges(const Mat& image, const Mat& regionMask) {
+    EdgeImages edgeImages;
+    Mat smoothed;
+    GaussianBlur(image, smoothed, Size(0, 0), edgeSmoothingSigma);
+    vector<Mat> channels;
+    split(smoothed, channels);
+    edgeImages.magnitude = Mat::zeros(image.size(), CV_32F);
+    edgeImages.gradientX = Mat::zeros(image.size(), CV_32F);
+    edgeImages.gradientY = Mat::zeros(image.size(), CV_32F);
+    for (Mat& channel : channels) {
+        Mat derivativeX, derivativeY, channelMagnitude;
+        Sobel(channel, derivativeX, CV_32F, 1, 0, 3, 1.0 / 8);
+        Sobel(channel, derivativeY, CV_32F, 0, 1, 3, 1.0 / 8);
+        magnitude(derivativeX, derivativeY, channelMagnitude);
+        Mat stronger = channelMagnitude > edgeImages.magnitude;
+        channelMagnitude.copyTo(edgeImages.magnitude, stronger);
+        derivativeX.copyTo(edgeImages.gradientX, stronger);
+        derivativeY.copyTo(edgeImages.gradientY, stronger);
+    }
+
+    vector<float> magnitudes;
+    for (int row = 0; row < image.rows; row += 3)
+        for (int column = 0; column < image.cols; column += 3)
+            if (regionMask.at<uchar>(row, column)) magnitudes.push_back(edgeImages.magnitude.at<float>(row, column));
+    edgeImages.threshold = (float)max(edgeThresholdMedianMultiple * medianValue(magnitudes), minimumEdgeThreshold);
+
+    Canny(smoothed, edgeImages.edges, 8 * cannyLowThresholdFraction * edgeImages.threshold, 8 * edgeImages.threshold, 3, true);
+    edgeImages.edges &= regionMask;
+    return edgeImages;
+}
+
+// Hough for circles of known radius. Every edge pixel votes for 2 points at expected ball
+// radius along its gradient line, rather than for a whole circle of points, which keeps clutter low.
+// votes are smoothed and divided by circumferenece so a complete circle scores about 1.
+// Division is done in double precision so every pixel rounds exactly as a plain float division does
+Mat circleScore(const EdgeImages& edgeImages, const Mat& expectedRadius) {
+    Size imageSize = edgeImages.edges.size();
+    Mat votes = Mat::zeros(imageSize, CV_32F);
+    const float voteWeight = 1.f / voteRadiusCount;
+    for (int row = 0; row < imageSize.height; row++)
+        for (int column = 0; column < imageSize.width; column++) {
+            if (!edgeImages.edges.at<uchar>(row, column)) continue;
+            float magnitude = edgeImages.magnitude.at<float>(row, column);
+            if (!(magnitude > 0)) continue;
+            float directionX = edgeImages.gradientX.at<float>(row, column) / magnitude;
+            float directionY = edgeImages.gradientY.at<float>(row, column) / magnitude;
+            float radius = expectedRadius.at<float>(row, column);
+            for (int side = -1; side <= 1; side += 2)
+                for (int step = 0; step < voteRadiusCount; step++) {
+                    float fraction = (float)(smallestVoteRadiusFraction + (largestVoteRadiusFraction - smallestVoteRadiusFraction) * step / (voteRadiusCount - 1));
+                    int centreColumn = cvRound(column + side * fraction * radius * directionX);
+                    int centreRow = cvRound(row + side * fraction * radius * directionY);
+                    if (centreColumn >= 0 && centreRow >= 0 && centreColumn < imageSize.width && centreRow < imageSize.height)
+                        votes.at<float>(centreRow, centreColumn) += voteWeight;
+                }
+        }
+    Mat smoothedVotes;
+    GaussianBlur(votes, smoothedVotes, Size(0, 0), voteSmoothingSigma);
+    smoothedVotes *= (float)(2 * CV_PI * voteSmoothingSigma * voteSmoothingSigma);
+    Mat radiusInDouble, circumferenceInDouble, circumference, roundedCircumference, votesInDouble, scoreInDouble, score;
+    expectedRadius.convertTo(radiusInDouble, CV_64F);
+    multiply(radiusInDouble, Scalar(2 * CV_PI), circumferenceInDouble);
+    circumferenceInDouble.convertTo(circumference, CV_32F);
+    circumference.convertTo(roundedCircumference, CV_64F);
+    smoothedVotes.convertTo(votesInDouble, CV_64F);
+    divide(votesInDouble, roundedCircumference, scoreInDouble);
+    scoreInDouble.convertTo(score, CV_32F);
+    patchNaNs(score, 0);
+    return score;
+}
+
 }
 
 void MyApplication() {
     utils::fs::createDirectories(outputFolder);
     Mat image = loadImage(imageFileNames[0]);
     if (image.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    Mat grey;
-    cvtColor(image, grey, COLOR_BGR2GRAY);
-    GaussianBlur(grey, grey, Size(9, 9), 2);
-    vector<Vec3f> circles;
-    // The radius range was picked by eye from the photo
-    HoughCircles(grey, circles, HOUGH_GRADIENT, 1, 20, 100, 30, 15, 30);
-    cout << "found " << circles.size() << " circles" << endl;
-    for (const Vec3f& found : circles)
-        circle(image, Point(cvRound(found[0]), cvRound(found[1])), cvRound(found[2]), Scalar(0, 0, 255), 2);
-    imwrite(outputFolder + "/circles.png", image);
+    Geometry geometry = buildGeometry(image.size());
+    EdgeImages edges = computeEdges(image, tableMask(image.size(), edgeRegionGrowth));
+    Mat score = circleScore(edges, geometry.expectedRadius);
+    Mat scaled, coloured;
+    score.convertTo(scaled, CV_8U, 255.0 / 0.8);
+    applyColorMap(scaled, coloured, COLORMAP_JET);
+    imwrite(outputFolder + "/edges.png", edges.edges);
+    imwrite(outputFolder + "/circle_score.png", coloured);
 }
