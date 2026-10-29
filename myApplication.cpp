@@ -216,12 +216,14 @@ void MyApplication() {
     utils::fs::createDirectories(outputFolder);
     Mat image = loadImage(imageFileNames[0]);
     if (image.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    Mat hsvImage;
-    cvtColor(image, hsvImage, COLOR_BGR2HSV);
-    ClothModel cloth = estimateCloth(hsvImage, tableMask(image.size(), innerClothGrowth));
-    cout << "cloth hue " << cloth.hue << " saturation " << cloth.saturation << endl;
-    Mat foreground = clothDistance(hsvImage, cloth) > 1.f;
-    morphologyEx(foreground, foreground, MORPH_OPEN, getStructuringElement(MORPH_ELLIPSE, Size(3, 3)));
-    morphologyEx(foreground, foreground, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(5, 5)));
-    imwrite(outputFolder + "/foreground.png", foreground);
+    Mat grey;
+    cvtColor(image, grey, COLOR_BGR2GRAY);
+    GaussianBlur(grey, grey, Size(9, 9), 2);
+    vector<Vec3f> circles;
+    // The radius range was picked by eye from the photo
+    HoughCircles(grey, circles, HOUGH_GRADIENT, 1, 20, 100, 30, 15, 30);
+    cout << "found " << circles.size() << " circles" << endl;
+    for (const Vec3f& found : circles)
+        circle(image, Point(cvRound(found[0]), cvRound(found[1])), cvRound(found[2]), Scalar(0, 0, 255), 2);
+    imwrite(outputFolder + "/circles.png", image);
 }
