@@ -59,6 +59,15 @@ const double smallestVoteRadiusFraction = 0.88;
 const double largestVoteRadiusFraction = 1.12;
 const double voteSmoothingSigma = 2.0;
 
+const double minimumOutlineScore = 0.25;
+const double minimumNonClothCoverage = 0.70;
+const double coverageDiscRadiusFraction = 0.70;
+const double peakClearingRadiusFraction = 0.6;
+const double minimumBallSeparation = 0.7 * ballDiameter;
+const int maximumBallCount = 16;
+const double cornerPocketExclusionRadius = 1.3 * ballDiameter;
+const double middlePocketExclusionRadius = 36.0;
+const double minimumCushionDistance = 0.5 * ballRadius;
 const char* imageFileNames[7] = { "AllBalls.jpeg", "Table1.jpeg", "Table2.jpeg", "Table3.jpeg",
                                   "Table4.jpeg", "Table5.jpeg", "Table6.jpeg" };
 const char* imageNames[7] = { "AllBalls", "Table1", "Table2", "Table3", "Table4", "Table5", "Table6" };
@@ -322,18 +331,114 @@ Mat circleScore(const EdgeImages& edgeImages, const Mat& expectedRadius) {
     return score;
 }
 
+// Fraction of a disc that lies on foreground. Disc is drawn in a small patch round its
+// centre, cut to image, rather than in a blank image size of picture
+double discCoverage(const Mat& foreground, Point2f centre, double discRadius) {
+    Point discCentre(centre);
+    int discRadiusPixels = cvRound(discRadius);
+    Rect patch = Rect(discCentre.x - discRadiusPixels, discCentre.y - discRadiusPixels, 2 * discRadiusPixels + 1, 2 * discRadiusPixels + 1) &
+                 Rect(Point(0, 0), foreground.size());
+    if (patch.area() <= 0) return 0.0;
+    Mat disc = Mat::zeros(patch.size(), CV_8U);
+    circle(disc, discCentre - patch.tl(), discRadiusPixels, Scalar(255), FILLED);
+    int pixelCount = countNonZero(disc);
+    return pixelCount ? (double)countNonZero(foreground(patch) & disc) / pixelCount : 0.0;
+}
+
+// Whether a ball centre could really be at this table position. A ball can't overlap a cushion, so its
+// centre is at least half a radius from it, allowing for centre seen from above being shifted a
+// little away from camera and it can't be over a pocket mouth
+bool isInsideTable(Point2f tablePoint) {
+    if (tablePoint.x < minimumCushionDistance || tablePoint.y < minimumCushionDistance ||
+        tablePoint.x > tableColumns - minimumCushionDistance || tablePoint.y > tableRows - minimumCushionDistance) return false;
+    const Point2f cornerPockets[4] = { Point2f(0, 0), Point2f(0, tableRows), Point2f(tableColumns, 0), Point2f(tableColumns, tableRows) };
+    for (const Point2f& pocket : cornerPockets)
+        if (hypot(tablePoint.x - pocket.x, tablePoint.y - pocket.y) < cornerPocketExclusionRadius) return false;
+    const Point2f middlePockets[2] = { Point2f(tableColumns / 2.f, 0), Point2f(tableColumns / 2.f, tableRows) };
+    for (const Point2f& pocket : middlePockets)
+        if (hypot(tablePoint.x - pocket.x, tablePoint.y - pocket.y) < middlePocketExclusionRadius) return false;
+    return true;
+}
+
+struct Detection {
+    Point2f imagePosition, tablePosition;
+    float radius = 0;
+    double outlineScore = 0;
+    int predictedBall = -1;
+};
+
+struct ImageAnalysis {
+    string name;
+    Mat image, hsvImage;
+    Geometry geometry;
+    ClothModel cloth;
+    Mat clothDistanceImage, foreground, score;
+    EdgeImages edges;
+    vector<Detection> detections;
+};
+
+// Stage 1 for one image
+// Takes the strongest circle, clears round it and goes again
+ImageAnalysis analyseImage(const Mat& image, const string& name) {
+    ImageAnalysis analysis;
+    analysis.name = name;
+    analysis.image = image;
+    analysis.geometry = buildGeometry(image.size());
+    cvtColor(image, analysis.hsvImage, COLOR_BGR2HSV);
+
+    Mat innerMask = tableMask(image.size(), innerClothGrowth);
+    analysis.cloth = estimateCloth(analysis.hsvImage, innerMask);
+    analysis.clothDistanceImage = clothDistance(analysis.hsvImage, analysis.cloth);
+    analysis.foreground = (analysis.clothDistanceImage > 1.f);
+    analysis.foreground.convertTo(analysis.foreground, CV_8U);
+    morphologyEx(analysis.foreground, analysis.foreground, MORPH_OPEN, getStructuringElement(MORPH_ELLIPSE, Size(3, 3)));
+    morphologyEx(analysis.foreground, analysis.foreground, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(5, 5)));
+
+    analysis.edges = computeEdges(image, tableMask(image.size(), edgeRegionGrowth));
+    analysis.score = circleScore(analysis.edges, analysis.geometry.expectedRadius);
+
+    Mat remainingScore = analysis.score.clone();
+    remainingScore.setTo(0, tableMask(image.size(), searchAreaGrowth) == 0);
+    for (int attempt = 0; attempt < 20 * maximumBallCount && (int)analysis.detections.size() < maximumBallCount; attempt++) {
+        double peakScore;
+        Point peakLocation;
+        minMaxLoc(remainingScore, 0, &peakScore, 0, &peakLocation);
+        cout << "peak " << peakScore << " at " << peakLocation << endl;
+        if (peakScore < minimumOutlineScore) break;
+        float radius = analysis.geometry.radiusAt(Point2f(peakLocation));
+        Point2f centre(peakLocation);
+        circle(remainingScore, peakLocation, cvRound(peakClearingRadiusFraction * radius), Scalar(0), FILLED);
+
+        Point2f tablePoint = analysis.geometry.toTable(centre);
+        if (!isInsideTable(tablePoint)) continue;
+        bool tooClose = false;
+        for (const Detection& other : analysis.detections)
+            if (hypot(other.imagePosition.x - centre.x, other.imagePosition.y - centre.y) < minimumBallSeparation) tooClose = true;
+        if (tooClose) continue;
+
+        double coverage = discCoverage(analysis.foreground, centre, coverageDiscRadiusFraction * radius);
+        if (coverage < minimumNonClothCoverage) continue;
+
+        Detection detection;
+        detection.imagePosition = centre;
+        detection.tablePosition = tablePoint;
+        detection.radius = radius;
+        detection.outlineScore = peakScore;
+        analysis.detections.push_back(detection);
+    }
+    return analysis;
+}
+
 }
 
 void MyApplication() {
     utils::fs::createDirectories(outputFolder);
     Mat image = loadImage(imageFileNames[0]);
     if (image.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    Geometry geometry = buildGeometry(image.size());
-    EdgeImages edges = computeEdges(image, tableMask(image.size(), edgeRegionGrowth));
-    Mat score = circleScore(edges, geometry.expectedRadius);
-    Mat scaled, coloured;
-    score.convertTo(scaled, CV_8U, 255.0 / 0.8);
-    applyColorMap(scaled, coloured, COLORMAP_JET);
-    imwrite(outputFolder + "/edges.png", edges.edges);
-    imwrite(outputFolder + "/circle_score.png", coloured);
+    ImageAnalysis analysis = analyseImage(image, imageNames[0]);
+    cout << analysis.detections.size() << " balls found" << endl;
+    Mat overlay = image.clone();
+    for (const Detection& detection : analysis.detections)
+        circle(overlay, Point(detection.imagePosition), cvRound(detection.radius), Scalar(0, 255, 0), 2);
+    imwrite(outputFolder + "/result_AllBalls.png", overlay);
 }
