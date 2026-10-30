@@ -413,7 +413,7 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
         if (!isInsideTable(tablePoint)) continue;
         bool tooClose = false;
         for (const Detection& other : analysis.detections)
-            if (hypot(other.imagePosition.x - centre.x, other.imagePosition.y - centre.y) < minimumBallSeparation) tooClose = true;
+            if (hypot(other.tablePosition.x - tablePoint.x, other.tablePosition.y - tablePoint.y) < minimumBallSeparation) tooClose = true;
         if (tooClose) continue;
 
         double coverage = discCoverage(analysis.foreground, centre, coverageDiscRadiusFraction * radius);
