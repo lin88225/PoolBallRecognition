@@ -68,9 +68,45 @@ const int maximumBallCount = 16;
 const double cornerPocketExclusionRadius = 1.3 * ballDiameter;
 const double middlePocketExclusionRadius = 36.0;
 const double minimumCushionDistance = 0.5 * ballRadius;
+const double matchTolerance = ballRadius;
+
+// Ground truth as row and column in table coordinates, with -1 for a ball that isn't on table.
+// Each image lists balls 1 to 15 then the white ball. First image is AllBalls, then Table1 to Table6.
+// Values are from supplied spreadsheet (second correction version)
+const int groundTruth[7][ballCount][2] = {
+  { {253,908},{250,959},{255,1013},{256,1072},{254,1132},{262,1184},{256,1244},{253,1307},
+    {329,901},{330,961},{335,1013},{336,1067},{334,1130},{345,1187},{342,1245},{293,797} },
+  { {309,1092},{1212,429},{383,1131},{1050,335},{285,1211},{261,1170},{352,1173},{331,1132},
+    {240,1210},{310,1170},{1169,407},{281,1135},{374,1212},{360,1091},{331,1213},{288,29} },
+  { {282,1103},{620,1224},{391,1121},{315,1046},{310,1305},{202,621},{361,1173},{331,1132},
+    {177,725},{185,1269},{665,798},{296,438},{53,1235},{362,1090},{399,1205},{507,1169} },
+  { {23,908},{616,1224},{447,1199},{336,29},{305,1406},{210,621},{260,1294},{226,1252},
+    {177,725},{171,1270},{665,798},{249,351},{53,1233},{169,901},{399,1201},{434,29} },
+  { {23,908},{546,1407},{444,1204},{-1,-1},{305,1406},{210,621},{260,1294},{226,1252},
+    {181,724},{171,1270},{665,798},{249,351},{58,1231},{169,901},{399,1201},{88,1392} },
+  { {535,23},{546,1407},{444,1204},{-1,-1},{305,1406},{131,25},{260,1294},{226,1252},
+    {538,72},{171,1270},{665,798},{249,351},{-1,-1},{169,901},{399,1201},{608,26} },
+  { {535,23},{477,1364},{444,1204},{-1,-1},{305,1406},{131,25},{260,1294},{226,1252},
+    {538,72},{171,1270},{-1,-1},{249,351},{-1,-1},{169,901},{399,1201},{629,947} }
+};
 const char* imageFileNames[7] = { "AllBalls.jpeg", "Table1.jpeg", "Table2.jpeg", "Table3.jpeg",
                                   "Table4.jpeg", "Table5.jpeg", "Table6.jpeg" };
 const char* imageNames[7] = { "AllBalls", "Table1", "Table2", "Table3", "Table4", "Table5", "Table6" };
+
+// Name printed on a ball, where balls 0 to 14 are numbers 1 to 15 and ball 15 is white
+string ballName(int ball) {
+    return ball == 15 ? string("W") : to_string(ball + 1);
+}
+
+string formatNumber(double value, int decimals = 1) {
+    char text[64];
+    snprintf(text, sizeof(text), "%.*f", decimals, value);
+    return string(text);
+}
+
+string formatPercentage(double fraction) {
+    return formatNumber(100.0 * fraction, 1);
+}
 
 // Middle value of a list, which reorders list
 double medianValue(vector<float>& values) {
@@ -429,16 +465,88 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
     return analysis;
 }
 
+// How one image compares with ground truth. Detection status is 0 when correctly named, 1 when
+// named wrongly and 2 for a false detection
+struct ImageEvaluation {
+    string name;
+    int groundTruthCount = 0, detectionCount = 0;
+    int truePositives = 0, falsePositives = 0, falseNegatives = 0;
+    vector<double> errors;
+    int located = 0, correctNames = 0, correctTypes = 0;
+    vector<int> detectionStatus;
+    vector<int> detectionTruth;
+    vector<int> missedBalls;
+};
+
+// Type of a ball, 0 for a solid, 1 for a stripe, 2 for black and 3 for white
+int ballType(int ball) {
+    return ball == 15 ? 3 : (ball == 7 ? 2 : (ball < 7 ? 0 : 1));
+}
+
+// Matches detections to ground truth one to one, closest pairs first, within one ball radius, then
+// counts the true positives, false positives and misses and compares names given
+ImageEvaluation evaluate(const ImageAnalysis& analysis, int imageIndex, int nameCounts[ballCount][ballCount]) {
+    ImageEvaluation evaluation;
+    evaluation.name = imageNames[imageIndex];
+    evaluation.detectionCount = (int)analysis.detections.size();
+    vector<Point2f> truePositions(ballCount);
+    vector<bool> present(ballCount, false);
+    for (int ball = 0; ball < ballCount; ball++)
+        if (groundTruth[imageIndex][ball][0] >= 0) {
+            present[ball] = true;
+            truePositions[ball] = Point2f((float)groundTruth[imageIndex][ball][1], (float)groundTruth[imageIndex][ball][0]);
+            evaluation.groundTruthCount++;
+        }
+    vector<tuple<double, int, int>> pairs;
+    for (int detection = 0; detection < evaluation.detectionCount; detection++)
+        for (int ball = 0; ball < ballCount; ball++)
+            if (present[ball]) {
+                double gap = hypot(analysis.detections[detection].tablePosition.x - truePositions[ball].x,
+                                   analysis.detections[detection].tablePosition.y - truePositions[ball].y);
+                if (gap <= matchTolerance) pairs.push_back(make_tuple(gap, detection, ball));
+            }
+    sort(pairs.begin(), pairs.end());
+    vector<int> detectionMatch(evaluation.detectionCount, -1), ballMatch(ballCount, -1);
+    for (auto& pairing : pairs) {
+        int detection = get<1>(pairing), ball = get<2>(pairing);
+        if (detectionMatch[detection] < 0 && ballMatch[ball] < 0) {
+            detectionMatch[detection] = ball;
+            ballMatch[ball] = detection;
+            evaluation.errors.push_back(get<0>(pairing));
+        }
+    }
+    evaluation.detectionStatus.assign(evaluation.detectionCount, 2);
+    evaluation.detectionTruth.assign(evaluation.detectionCount, -1);
+    for (int detection = 0; detection < evaluation.detectionCount; detection++) {
+        if (detectionMatch[detection] < 0) { evaluation.falsePositives++; continue; }
+        evaluation.truePositives++;
+        int ball = detectionMatch[detection];
+        evaluation.detectionTruth[detection] = ball;
+        evaluation.located++;
+        int predicted = analysis.detections[detection].predictedBall;
+        if (predicted >= 0) {
+            nameCounts[ball][predicted]++;
+            if (predicted == ball) evaluation.correctNames++;
+            if (ballType(predicted) == ballType(ball)) evaluation.correctTypes++;
+            evaluation.detectionStatus[detection] = (predicted == ball) ? 0 : 1;
+        } else evaluation.detectionStatus[detection] = 0;
+    }
+    for (int ball = 0; ball < ballCount; ball++)
+        if (present[ball] && ballMatch[ball] < 0) { evaluation.falseNegatives++; evaluation.missedBalls.push_back(ball); }
+    return evaluation;
+}
+
 }
 
 void MyApplication() {
-    utils::fs::createDirectories(outputFolder);
-    Mat image = loadImage(imageFileNames[0]);
-    if (image.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    ImageAnalysis analysis = analyseImage(image, imageNames[0]);
-    cout << analysis.detections.size() << " balls found" << endl;
-    Mat overlay = image.clone();
-    for (const Detection& detection : analysis.detections)
-        circle(overlay, Point(detection.imagePosition), cvRound(detection.radius), Scalar(0, 255, 0), 2);
-    imwrite(outputFolder + "/result_AllBalls.png", overlay);
+    for (int image = 0; image < 7; image++) {
+        Mat picture = loadImage(imageFileNames[image]);
+        if (picture.empty()) { cout << "couldn't find " << imageFileNames[image] << endl; continue; }
+        ImageAnalysis analysis = analyseImage(picture, imageNames[image]);
+        int nameCounts[ballCount][ballCount] = {};
+        ImageEvaluation evaluation = evaluate(analysis, image, nameCounts);
+        cout << imageNames[image] << "  on table " << evaluation.groundTruthCount << ", found " << evaluation.detectionCount
+             << ", true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
+             << ", missed " << evaluation.falseNegatives << endl;
+    }
 }
