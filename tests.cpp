@@ -114,6 +114,91 @@ static void testTrainingImageHasAllSixteenBalls() {
 }
 
 // ---------------------------------------------------------------------------
+// Cloth colour model
+// ---------------------------------------------------------------------------
+
+static Mat flatHsv(Size size, Vec3b value) {
+    return Mat(size, CV_8UC3, Scalar(value[0], value[1], value[2]));
+}
+
+static void testClothModelFindsFlatColour() {
+    Mat hsv = flatHsv(Size(120, 120), Vec3b(60, 150, 200));
+    Mat inner(hsv.size(), CV_8U, Scalar(255));
+    ClothModel cloth = estimateCloth(hsv, inner);
+    CHECK_NEAR(cloth.hue, 60, 1.0);
+    CHECK_NEAR(cloth.saturation, 150, 1.0);
+    CHECK_NEAR(cloth.brightness, 200, 1.0);
+    CHECK(cloth.hueTolerance >= minimumClothHueTolerance);
+    CHECK(cloth.saturationTolerance >= minimumClothSaturationTolerance);
+}
+
+static ClothModel testCloth() {
+    ClothModel cloth;
+    cloth.hue = 60; cloth.saturation = 150;
+    cloth.hueTolerance = 5; cloth.saturationTolerance = 20;
+    cloth.brightness = 200;
+    return cloth;
+}
+
+static void testClothDistance() {
+    Mat hsv = flatHsv(Size(3, 1), Vec3b(60, 150, 200));
+    hsv.at<Vec3b>(0, 1) = Vec3b(100, 150, 200);
+    hsv.at<Vec3b>(0, 2) = Vec3b(60, 150, 20);
+    Mat distance = clothDistance(hsv, testCloth());
+    CHECK(distance.at<float>(0, 0) < 1.f);
+    CHECK(distance.at<float>(0, 1) > 1.f);
+    CHECK_NEAR(distance.at<float>(0, 2), veryDarkClothDistance, 1e-6);
+}
+
+static void testShadowStillCountsAsCloth() {
+    Mat hsv = flatHsv(Size(1, 1), Vec3b(60, 150, 100));
+    CHECK(clothDistance(hsv, testCloth()).at<float>(0, 0) < 1.f);
+}
+
+// ---------------------------------------------------------------------------
+// Circle finding
+// ---------------------------------------------------------------------------
+
+static void testCircleScoreFindsADisc() {
+    Mat image(160, 200, CV_8UC3, Scalar(40, 120, 40));
+    circle(image, Point(100, 80), 20, Scalar(230, 230, 230), FILLED);
+    Mat region(image.size(), CV_8U, Scalar(255));
+    Mat expectedRadius(image.size(), CV_32F, Scalar(20));
+    Mat score = circleScore(computeEdges(image, region), expectedRadius);
+    double highest;
+    Point where;
+    minMaxLoc(score, 0, &highest, 0, &where);
+    CHECK_NEAR(where.x, 100, 2);
+    CHECK_NEAR(where.y, 80, 2);
+    CHECK(highest > minimumOutlineScore);
+}
+
+static void testCircleScoreIgnoresEmptyCloth() {
+    Mat image(160, 200, CV_8UC3, Scalar(40, 120, 40));
+    Mat region(image.size(), CV_8U, Scalar(255));
+    Mat expectedRadius(image.size(), CV_32F, Scalar(20));
+    double highest;
+    minMaxLoc(circleScore(computeEdges(image, region), expectedRadius), 0, &highest);
+    CHECK(highest < 0.01);
+}
+
+static void testDiscCoverage() {
+    Mat foreground = Mat::zeros(100, 100, CV_8U);
+    circle(foreground, Point(50, 50), 10, Scalar(255), FILLED);
+    CHECK(discCoverage(foreground, Point2f(50, 50), 8) > 0.99);
+    CHECK(discCoverage(foreground, Point2f(10, 10), 8) < 0.01);
+    CHECK_NEAR(discCoverage(foreground, Point2f(-50, -50), 8), 0, 1e-9);
+}
+
+static void testIsInsideTable() {
+    CHECK(isInsideTable(Point2f(tableColumns / 2.f, tableRows / 2.f)));
+    CHECK(!isInsideTable(Point2f(2, 300)));
+    CHECK(!isInsideTable(Point2f(20, 20)));
+    CHECK(!isInsideTable(Point2f(tableColumns / 2.f, 10)));
+    CHECK(!isInsideTable(Point2f(-5, 100)));
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     runTest("formatting", testFormatting);
@@ -128,6 +213,15 @@ int main() {
 
     runTest("ground truth is inside the table", testGroundTruthIsInsideTheTable);
     runTest("training image has all sixteen balls", testTrainingImageHasAllSixteenBalls);
+
+    runTest("cloth model finds a flat colour", testClothModelFindsFlatColour);
+    runTest("cloth distance", testClothDistance);
+    runTest("shadow still counts as cloth", testShadowStillCountsAsCloth);
+
+    runTest("circle score finds a disc", testCircleScoreFindsADisc);
+    runTest("circle score ignores empty cloth", testCircleScoreIgnoresEmptyCloth);
+    runTest("disc coverage", testDiscCoverage);
+    runTest("is inside table", testIsInsideTable);
     cout << "\n" << checkCount << " checks, " << failureCount << " failed" << endl;
     return failureCount == 0 ? 0 : 1;
 }
