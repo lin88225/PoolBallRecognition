@@ -81,7 +81,7 @@ static void testBallsLookBiggerNearTheCamera() {
     Geometry geometry = buildGeometry(pictureSize);
     float farRadius = geometry.radiusAt(Point2f(960, 60));
     float nearRadius = geometry.radiusAt(Point2f(960, 440));
-    CHECK(farRadius > nearRadius);
+    CHECK(nearRadius > farRadius);
     CHECK(farRadius > 5.f && nearRadius < 100.f);
 }
 
