@@ -199,6 +199,60 @@ static void testIsInsideTable() {
 }
 
 // ---------------------------------------------------------------------------
+// Classifier
+// ---------------------------------------------------------------------------
+
+static vector<BallFeatures> pretendTrainingFeatures() {
+    vector<BallFeatures> features(ballCount);
+    for (int ball = 0; ball < 15; ball++) {
+        int colour = ball % 8;
+        features[ball].outerRingWhiteFraction = ball < 8 ? 0.02 : 0.45;
+        features[ball].darkFraction = 0.02;
+        features[ball].hue = 10 + 22 * colour;
+        features[ball].saturation = 150;
+        features[ball].value = 150;
+    }
+    features[7].darkFraction = 0.9;
+    features[15].outerRingWhiteFraction = 0.95;
+    return features;
+}
+
+static void testTrainingSetsSensibleThresholds() {
+    Classifier classifier = trainClassifier(pretendTrainingFeatures());
+    CHECK(classifier.cueThreshold > 0.45 && classifier.cueThreshold < 0.95);
+    CHECK(classifier.blackThreshold > 0.02 && classifier.blackThreshold < 0.9);
+    CHECK(classifier.stripeThreshold > 0.02 && classifier.stripeThreshold < 0.45);
+}
+
+static void testClassifyRecoversTrainingBalls() {
+    vector<BallFeatures> features = pretendTrainingFeatures();
+    Classifier classifier = trainClassifier(features);
+    CHECK(classify(classifier, features[15]) == 15);
+    CHECK(classify(classifier, features[7]) == 7);
+    for (int ball : { 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14 }) CHECK(classify(classifier, features[ball]) == ball);
+}
+
+static void testStripesAreOnlyComparedWithStripes() {
+    vector<BallFeatures> features = pretendTrainingFeatures();
+    features[8] = features[0];
+    features[8].outerRingWhiteFraction = 0.45;
+    Classifier classifier = trainClassifier(features);
+    BallFeatures stripe = features[0];
+    stripe.outerRingWhiteFraction = 0.45;
+    CHECK(classify(classifier, stripe) >= 8);
+}
+
+static void testColourDistance() {
+    BallFeatures first, second, third;
+    first.hue = 10; first.saturation = 100; first.value = 100;
+    second = first;
+    third = first;
+    third.hue = 170;
+    CHECK_NEAR(colourDistance(first, second), 0, 1e-9);
+    CHECK_NEAR(colourDistance(first, third), 40, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     runTest("formatting", testFormatting);
@@ -222,6 +276,11 @@ int main() {
     runTest("circle score ignores empty cloth", testCircleScoreIgnoresEmptyCloth);
     runTest("disc coverage", testDiscCoverage);
     runTest("is inside table", testIsInsideTable);
+
+    runTest("training sets sensible thresholds", testTrainingSetsSensibleThresholds);
+    runTest("classify recovers training balls", testClassifyRecoversTrainingBalls);
+    runTest("stripes are only compared with stripes", testStripesAreOnlyComparedWithStripes);
+    runTest("colour distance", testColourDistance);
     cout << "\n" << checkCount << " checks, " << failureCount << " failed" << endl;
     return failureCount == 0 ? 0 : 1;
 }
