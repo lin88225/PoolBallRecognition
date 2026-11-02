@@ -68,6 +68,15 @@ const int maximumBallCount = 16;
 const double cornerPocketExclusionRadius = 1.3 * ballDiameter;
 const double middlePocketExclusionRadius = 36.0;
 const double minimumCushionDistance = 0.5 * ballRadius;
+const double colourDiscRadiusFraction = 0.80;
+const double smallestWhiteSaturationLimit = 0.30 * 255;
+const double whiteMinimumBrightnessRatio = 0.80;
+const double darkMaximumBrightnessRatio = 0.40;
+const double outerRingInnerRadiusFraction = 0.7;
+const double clothRingInnerRadiusFraction = 1.3;
+const double clothRingOuterRadiusFraction = 2.3;
+const size_t minimumClothRingPixelCount = 30;
+
 const double matchTolerance = ballRadius;
 
 // Ground truth as row and column in table coordinates, with -1 for a ball that isn't on table.
@@ -396,10 +405,17 @@ bool isInsideTable(Point2f tablePoint) {
     return true;
 }
 
+struct BallFeatures {
+    double outerRingWhiteFraction = 0;
+    double darkFraction = 0;
+    double hue = 0, saturation = 0, value = 0;
+};
+
 struct Detection {
     Point2f imagePosition, tablePosition;
     float radius = 0;
     double outlineScore = 0;
+    BallFeatures features;
     int predictedBall = -1;
 };
 
@@ -412,6 +428,118 @@ struct ImageAnalysis {
     EdgeImages edges;
     vector<Detection> detections;
 };
+
+// Median brightness of the cloth in a ring around a ball. As in shadow detection, a ball's
+// brightness is judged as a ratio to this, so changes in lighting across table cancel out
+float localClothBrightness(const ImageAnalysis& analysis, Point2f centre, double radius) {
+    vector<float> brightness;
+    double ringInner = clothRingInnerRadiusFraction * radius, ringOuter = clothRingOuterRadiusFraction * radius;
+    for (int row = max(0, (int)(centre.y - ringOuter)); row <= min(analysis.image.rows - 1, (int)(centre.y + ringOuter)); row++)
+        for (int column = max(0, (int)(centre.x - ringOuter)); column <= min(analysis.image.cols - 1, (int)(centre.x + ringOuter)); column++) {
+            double distanceFromCentre = hypot(column - centre.x, row - centre.y);
+            if (distanceFromCentre < ringInner || distanceFromCentre > ringOuter || analysis.foreground.at<uchar>(row, column)) continue;
+            brightness.push_back(analysis.hsvImage.at<Vec3b>(row, column)[2]);
+        }
+    return brightness.size() >= minimumClothRingPixelCount ? (float)medianValue(brightness) : analysis.cloth.brightness;
+}
+
+// Measures a ball's appearance. Each pixel that isn't cloth or covered by a ball nearer camera
+// (lower in image) is dark, white or coloured, judged by its saturation and by its brightness as a
+// ratio to local cloth
+BallFeatures extractFeatures(const ImageAnalysis& analysis, Point2f centre, double radius, double whiteSaturationLimit) {
+    BallFeatures features;
+    float clothBrightness = localClothBrightness(analysis, centre, radius);
+    double colourDiscRadius = colourDiscRadiusFraction * radius;
+    int left = max(0, (int)floor(centre.x - radius)), right = min(analysis.image.cols - 1, (int)ceil(centre.x + radius));
+    int top = max(0, (int)floor(centre.y - radius)), bottom = min(analysis.image.rows - 1, (int)ceil(centre.y + radius));
+    int discCount = 0, darkCount = 0, colouredCount = 0, ringCount = 0, ringWhiteCount = 0;
+    double hueCosineSum = 0, hueSineSum = 0, saturationSum = 0, brightnessSum = 0;
+    for (int row = top; row <= bottom; row++)
+        for (int column = left; column <= right; column++) {
+            double squaredDistance = (column - centre.x) * (column - centre.x) + (row - centre.y) * (row - centre.y);
+            if (squaredDistance > radius * radius) continue;
+            if (!analysis.foreground.at<uchar>(row, column)) continue;
+            Vec3b pixel = analysis.hsvImage.at<Vec3b>(row, column);
+            double brightnessRatio = pixel[2] / clothBrightness;
+            bool isDark = brightnessRatio <= darkMaximumBrightnessRatio;
+            bool isWhite = !isDark && pixel[1] <= whiteSaturationLimit && brightnessRatio >= whiteMinimumBrightnessRatio;
+            if (squaredDistance >= outerRingInnerRadiusFraction * outerRingInnerRadiusFraction * radius * radius) {
+                ringCount++;
+                if (isWhite) ringWhiteCount++;
+            }
+            if (squaredDistance > colourDiscRadius * colourDiscRadius) continue;
+            discCount++;
+            if (isDark) darkCount++;
+            else if (!isWhite) {
+                colouredCount++;
+                hueCosineSum += cos(pixel[0] * CV_PI / 90.0); hueSineSum += sin(pixel[0] * CV_PI / 90.0);
+                saturationSum += pixel[1]; brightnessSum += pixel[2];
+            }
+        }
+    if (discCount > 0) features.darkFraction = (double)darkCount / discCount;
+    if (ringCount > 0) features.outerRingWhiteFraction = (double)ringWhiteCount / ringCount;
+    if (colouredCount > 0) {
+        features.hue = fmod(atan2(hueSineSum, hueCosineSum) * 90.0 / CV_PI + 180.0, 180.0);
+        features.saturation = saturationSum / colouredCount;
+        features.value = brightnessSum / colouredCount;
+    }
+    return features;
+}
+
+struct Classifier {
+    double cueThreshold = 0.8, blackThreshold = 0.6, stripeThreshold = 0.3;
+    BallFeatures prototypes[15];
+};
+
+// Colour difference in hue, saturation and value, each in its natural units (degrees and percent of
+// largest value), so no colour property is favoured. Hue is an angle, so difference wraps round
+double colourDistance(const BallFeatures& first, const BallFeatures& second) {
+    double hueGap = fabs(first.hue - second.hue) * 2.0;
+    if (hueGap > 180) hueGap = 360 - hueGap;
+    double saturationGap = (first.saturation - second.saturation) * 100.0 / 255.0;
+    double valueGap = (first.value - second.value) * 100.0 / 255.0;
+    return sqrt(hueGap * hueGap + saturationGap * saturationGap + valueGap * valueGap);
+}
+
+double meanOfFeature(const vector<BallFeatures>& features, int firstBall, int lastBall, double BallFeatures::*feature) {
+    double sum = 0;
+    for (int ball = firstBall; ball <= lastBall; ball++) sum += features[ball].*feature;
+    return sum / (lastBall - firstBall + 1);
+}
+
+// Sets each threshold halfway between classes it separates. White of cue ball and of
+// stripes reaches outline of ball, while number circle of a solid sits on its face, so
+// outer ring white fraction is used for cue ball and for stripes
+Classifier trainClassifier(const vector<BallFeatures>& features) {
+    Classifier classifier;
+    double mostWhiteOther = 0;
+    for (int ball = 0; ball < 15; ball++) mostWhiteOther = max(mostWhiteOther, features[ball].outerRingWhiteFraction);
+    classifier.cueThreshold = features[15].outerRingWhiteFraction > mostWhiteOther
+        ? (features[15].outerRingWhiteFraction + mostWhiteOther) / 2 : 0.9 * features[15].outerRingWhiteFraction;
+    double mostDarkOther = 0;
+    for (int ball = 0; ball < 15; ball++) if (ball != 7) mostDarkOther = max(mostDarkOther, features[ball].darkFraction);
+    classifier.blackThreshold = features[7].darkFraction > mostDarkOther
+        ? (features[7].darkFraction + mostDarkOther) / 2 : 0.5 * features[7].darkFraction;
+    double solidWhite = meanOfFeature(features, 0, 6, &BallFeatures::outerRingWhiteFraction);
+    double stripeWhite = meanOfFeature(features, 8, 14, &BallFeatures::outerRingWhiteFraction);
+    classifier.stripeThreshold = (solidWhite + stripeWhite) / 2;
+    for (int ball = 0; ball < 15; ball++) classifier.prototypes[ball] = features[ball];
+    return classifier;
+}
+
+// Names a ball. Solids are only compared with solids and stripes with stripes, because a stripe's band
+// blends with white beside it and so looks a little different from solid of same colour
+int classify(const Classifier& classifier, const BallFeatures& features) {
+    if (features.outerRingWhiteFraction > classifier.cueThreshold) return 15;
+    if (features.darkFraction > classifier.blackThreshold) return 7;
+    int bestBall = 0;
+    double bestDistance = 1e18;
+    for (int ball = 0; ball < 15; ball++) {
+        double distanceToPrototype = colourDistance(features, classifier.prototypes[ball]);
+        if (distanceToPrototype < bestDistance) { bestDistance = distanceToPrototype; bestBall = ball; }
+    }
+    return bestBall;
+}
 
 // Stage 1 for one image
 // Takes the strongest circle, clears round it and goes again
@@ -539,14 +667,30 @@ ImageEvaluation evaluate(const ImageAnalysis& analysis, int imageIndex, int name
 }
 
 void MyApplication() {
+    Mat trainingImage = loadImage(imageFileNames[0]);
+    if (trainingImage.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
+    ImageAnalysis training = analyseImage(trainingImage, imageNames[0]);
+
+    // Features of the 16 balls in AllBalls, taken at the spreadsheet positions
+    double whiteSaturationLimit = smallestWhiteSaturationLimit;
+    vector<BallFeatures> trainingFeatures(ballCount);
+    for (int ball = 0; ball < ballCount; ball++) {
+        Point2f centre = training.geometry.toImage(Point2f((float)groundTruth[0][ball][1], (float)groundTruth[0][ball][0]));
+        trainingFeatures[ball] = extractFeatures(training, centre, training.geometry.radiusAt(centre), whiteSaturationLimit);
+    }
+    Classifier classifier = trainClassifier(trainingFeatures);
+
     for (int image = 0; image < 7; image++) {
         Mat picture = loadImage(imageFileNames[image]);
         if (picture.empty()) { cout << "couldn't find " << imageFileNames[image] << endl; continue; }
         ImageAnalysis analysis = analyseImage(picture, imageNames[image]);
+        for (Detection& detection : analysis.detections) {
+            detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, whiteSaturationLimit);
+            detection.predictedBall = classify(classifier, detection.features);
+        }
         int nameCounts[ballCount][ballCount] = {};
         ImageEvaluation evaluation = evaluate(analysis, image, nameCounts);
-        cout << imageNames[image] << "  on table " << evaluation.groundTruthCount << ", found " << evaluation.detectionCount
-             << ", true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
-             << ", missed " << evaluation.falseNegatives << endl;
+        cout << imageNames[image] << "  true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
+             << ", missed " << evaluation.falseNegatives << ", named correctly " << evaluation.correctNames << " of " << evaluation.located << endl;
     }
 }
