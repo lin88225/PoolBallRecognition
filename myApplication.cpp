@@ -532,9 +532,11 @@ Classifier trainClassifier(const vector<BallFeatures>& features) {
 int classify(const Classifier& classifier, const BallFeatures& features) {
     if (features.outerRingWhiteFraction > classifier.cueThreshold) return 15;
     if (features.darkFraction > classifier.blackThreshold) return 7;
+    bool isStripe = features.outerRingWhiteFraction > classifier.stripeThreshold;
     int bestBall = 0;
     double bestDistance = 1e18;
-    for (int ball = 0; ball < 15; ball++) {
+    for (int colour = 0; colour < 7; colour++) {
+        int ball = isStripe ? colour + 8 : colour;
         double distanceToPrototype = colourDistance(features, classifier.prototypes[ball]);
         if (distanceToPrototype < bestDistance) { bestDistance = distanceToPrototype; bestBall = ball; }
     }
