@@ -253,6 +253,31 @@ static void testColourDistance() {
 }
 
 // ---------------------------------------------------------------------------
+// Balls hiding behind other balls
+// ---------------------------------------------------------------------------
+
+static void testVisibleOutline() {
+    Mat allCloth(200, 200, CV_8U, Scalar(255));
+    vector<Detection> none;
+    CHECK_NEAR(visibleOutline(Point2f(100, 100), 20, none, allCloth), 1.0, 1e-9);
+
+    Detection front;
+    front.imagePosition = Point2f(100, 110);
+    front.radius = 20;
+    vector<Detection> inFront(1, front);
+    double visible = visibleOutline(Point2f(100, 100), 20, inFront, allCloth);
+    CHECK(visible < 1.0 && visible > 0.3);
+
+    Detection behind = front;
+    behind.imagePosition = Point2f(100, 90);
+    vector<Detection> atTheBack(1, behind);
+    CHECK_NEAR(visibleOutline(Point2f(100, 100), 20, atTheBack, allCloth), 1.0, 1e-9);
+
+    Mat noCloth(200, 200, CV_8U, Scalar(0));
+    CHECK_NEAR(visibleOutline(Point2f(100, 100), 20, none, noCloth), 0.0, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     runTest("formatting", testFormatting);
@@ -281,6 +306,8 @@ int main() {
     runTest("classify recovers training balls", testClassifyRecoversTrainingBalls);
     runTest("stripes are only compared with stripes", testStripesAreOnlyComparedWithStripes);
     runTest("colour distance", testColourDistance);
+
+    runTest("visible outline", testVisibleOutline);
     cout << "\n" << checkCount << " checks, " << failureCount << " failed" << endl;
     return failureCount == 0 ? 0 : 1;
 }
