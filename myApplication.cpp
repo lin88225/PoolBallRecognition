@@ -452,6 +452,28 @@ float localClothBrightness(const ImageAnalysis& analysis, Point2f centre, double
     return brightness.size() >= minimumClothRingPixelCount ? (float)medianValue(brightness) : analysis.cloth.brightness;
 }
 
+// Saturation limit for white, learned from training cue ball in same way as cloth
+// tolerance, so a cream coloured cue ball and cream stripes count as white
+double learnWhiteSaturationLimit(const ImageAnalysis& analysis, Point2f centre, double radius) {
+    float clothBrightness = localClothBrightness(analysis, centre, radius);
+    double discRadius = colourDiscRadiusFraction * radius;
+    vector<float> saturations;
+    for (int row = max(0, (int)floor(centre.y - discRadius)); row <= min(analysis.image.rows - 1, (int)ceil(centre.y + discRadius)); row++)
+        for (int column = max(0, (int)floor(centre.x - discRadius)); column <= min(analysis.image.cols - 1, (int)ceil(centre.x + discRadius)); column++) {
+            if (hypot(column - centre.x, row - centre.y) > discRadius || !analysis.foreground.at<uchar>(row, column)) continue;
+            Vec3b pixel = analysis.hsvImage.at<Vec3b>(row, column);
+            if (pixel[2] / clothBrightness >= whiteMinimumBrightnessRatio) saturations.push_back(pixel[1]);
+        }
+    if (saturations.size() < 10) return smallestWhiteSaturationLimit;
+    vector<float> sorted = saturations;
+    double middle = medianValue(sorted);
+    vector<float> differences;
+    for (float saturation : saturations) differences.push_back((float)(saturation - middle));
+    double mean, deviation;
+    iterativeMeanAndDeviation(differences, saturationStartHalfWidth, mean, deviation);
+    return max(smallestWhiteSaturationLimit, middle + mean + toleranceInDeviations * deviation);
+}
+
 // Whether a ball at another centre is nearer camera, which is when it sits lower in image
 bool isNearerCamera(Point2f otherCentre, Point2f centre) {
     return otherCentre.y > centre.y + 1;
@@ -730,7 +752,8 @@ void MyApplication() {
     ImageAnalysis training = analyseImage(trainingImage, imageNames[0]);
 
     // Features of the 16 balls in AllBalls, taken at the spreadsheet positions
-    double whiteSaturationLimit = smallestWhiteSaturationLimit;
+    Point2f cueCentre = training.geometry.toImage(Point2f((float)groundTruth[0][15][1], (float)groundTruth[0][15][0]));
+    double whiteSaturationLimit = learnWhiteSaturationLimit(training, cueCentre, training.geometry.radiusAt(cueCentre));
     vector<BallFeatures> trainingFeatures(ballCount);
     for (int ball = 0; ball < ballCount; ball++) {
         Point2f centre = training.geometry.toImage(Point2f((float)groundTruth[0][ball][1], (float)groundTruth[0][ball][0]));
