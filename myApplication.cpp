@@ -65,9 +65,18 @@ const double coverageDiscRadiusFraction = 0.70;
 const double peakClearingRadiusFraction = 0.6;
 const double minimumBallSeparation = 0.7 * ballDiameter;
 const int maximumBallCount = 16;
+const double minimumSecondPassScore = 0.12;
+const double minimumVisibleOutline = 0.40;
 const double cornerPocketExclusionRadius = 1.3 * ballDiameter;
 const double middlePocketExclusionRadius = 36.0;
 const double minimumCushionDistance = 0.5 * ballRadius;
+const int attemptsPerBall = 20;
+
+// Window around a peak (7 x 7 pixels) used to find its centre and fraction of peak
+// that a score must reach to count towards that centre
+const int centreWindowHalfSize = 3;
+const double centrePeakFraction = 0.8;
+
 const double colourDiscRadiusFraction = 0.80;
 const double smallestWhiteSaturationLimit = 0.30 * 255;
 const double whiteMinimumBrightnessRatio = 0.80;
@@ -443,6 +452,11 @@ float localClothBrightness(const ImageAnalysis& analysis, Point2f centre, double
     return brightness.size() >= minimumClothRingPixelCount ? (float)medianValue(brightness) : analysis.cloth.brightness;
 }
 
+// Whether a ball at another centre is nearer camera, which is when it sits lower in image
+bool isNearerCamera(Point2f otherCentre, Point2f centre) {
+    return otherCentre.y > centre.y + 1;
+}
+
 // Measures a ball's appearance. Each pixel that isn't cloth or covered by a ball nearer camera
 // (lower in image) is dark, white or coloured, judged by its saturation and by its brightness as a
 // ratio to local cloth
@@ -458,7 +472,10 @@ BallFeatures extractFeatures(const ImageAnalysis& analysis, Point2f centre, doub
         for (int column = left; column <= right; column++) {
             double squaredDistance = (column - centre.x) * (column - centre.x) + (row - centre.y) * (row - centre.y);
             if (squaredDistance > radius * radius) continue;
-            if (!analysis.foreground.at<uchar>(row, column)) continue;
+            bool hidden = false;
+            for (const Detection& other : analysis.detections)
+                if (isNearerCamera(other.imagePosition, centre) && hypot(column - other.imagePosition.x, row - other.imagePosition.y) < other.radius) { hidden = true; break; }
+            if (hidden || !analysis.foreground.at<uchar>(row, column)) continue;
             Vec3b pixel = analysis.hsvImage.at<Vec3b>(row, column);
             double brightnessRatio = pixel[2] / clothBrightness;
             bool isDark = brightnessRatio <= darkMaximumBrightnessRatio;
@@ -543,8 +560,28 @@ int classify(const Classifier& classifier, const BallFeatures& features) {
     return bestBall;
 }
 
-// Stage 1 for one image
-// Takes the strongest circle, clears round it and goes again
+// Fraction of a circle's outline that lies over the cloth and isn't covered by a ball already found
+// nearer camera. A cushion can hide bottom of a ball resting against it and its colour is close
+// to cloth, so outline outside the cloth's area isn't expected to give edges either
+double visibleOutline(Point2f centre, double radius, const vector<Detection>& detections, const Mat& clothArea) {
+    const int pointCount = 72;
+    int visibleCount = 0;
+    for (int point = 0; point < pointCount; point++) {
+        double angle = 2 * CV_PI * point / pointCount;
+        double pointX = centre.x + radius * cos(angle), pointY = centre.y + radius * sin(angle);
+        int column = cvRound(pointX), row = cvRound(pointY);
+        bool covered = column < 0 || row < 0 || column >= clothArea.cols || row >= clothArea.rows || !clothArea.at<uchar>(row, column);
+        for (const Detection& detection : detections)
+            if (isNearerCamera(detection.imagePosition, centre) && hypot(pointX - detection.imagePosition.x, pointY - detection.imagePosition.y) < detection.radius) { covered = true; break; }
+        if (!covered) visibleCount++;
+    }
+    return (double)visibleCount / pointCount;
+}
+
+// Stage 1 for one image. Builds cloth model and foreground, finds edges, scores circles of
+// expected size, then picks balls greedily in two passes. First pass takes clear circles.
+// Second looks again at weaker peaks and judges each one only on part of its outline that could be
+// seen. Balls overlap in camera image, so separation test is made on table
 ImageAnalysis analyseImage(const Mat& image, const string& name) {
     ImageAnalysis analysis;
     analysis.name = name;
@@ -563,34 +600,53 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
     analysis.edges = computeEdges(image, tableMask(image.size(), edgeRegionGrowth));
     analysis.score = circleScore(analysis.edges, analysis.geometry.expectedRadius);
 
-    Mat remainingScore = analysis.score.clone();
-    remainingScore.setTo(0, tableMask(image.size(), searchAreaGrowth) == 0);
-    for (int attempt = 0; attempt < 20 * maximumBallCount && (int)analysis.detections.size() < maximumBallCount; attempt++) {
-        double peakScore;
-        Point peakLocation;
-        minMaxLoc(remainingScore, 0, &peakScore, 0, &peakLocation);
-        cout << "peak " << peakScore << " at " << peakLocation << endl;
-        if (peakScore < minimumOutlineScore) break;
-        float radius = analysis.geometry.radiusAt(Point2f(peakLocation));
-        Point2f centre(peakLocation);
-        circle(remainingScore, peakLocation, cvRound(peakClearingRadiusFraction * radius), Scalar(0), FILLED);
+    Mat searchArea = tableMask(image.size(), searchAreaGrowth);
+    Mat clothArea = tableMask(image.size(), 0);
+    for (int pass = 0; pass < 2; pass++) {
+        Mat remainingScore = analysis.score.clone();
+        remainingScore.setTo(0, searchArea == 0);
+        double lowestPeak = pass == 0 ? minimumOutlineScore : minimumSecondPassScore;
+        for (int attempt = 0; attempt < attemptsPerBall * maximumBallCount && (int)analysis.detections.size() < maximumBallCount; attempt++) {
+            double peakScore;
+            Point peakLocation;
+            minMaxLoc(remainingScore, 0, &peakScore, 0, &peakLocation);
+            if (peakScore < lowestPeak) break;
+            float radius = analysis.geometry.radiusAt(Point2f(peakLocation));
+            Rect window = Rect(peakLocation.x - centreWindowHalfSize, peakLocation.y - centreWindowHalfSize,
+                               2 * centreWindowHalfSize + 1, 2 * centreWindowHalfSize + 1) & Rect(Point(0, 0), remainingScore.size());
+            Mat weights = remainingScore(window) - centrePeakFraction * peakScore;
+            threshold(weights, weights, 0, 0, THRESH_TOZERO);
+            Moments weightMoments = moments(weights);
+            Point2f centre = weightMoments.m00 > 0
+                ? Point2f(window.x + (float)(weightMoments.m10 / weightMoments.m00), window.y + (float)(weightMoments.m01 / weightMoments.m00))
+                : Point2f(peakLocation);
+            circle(remainingScore, peakLocation, cvRound(peakClearingRadiusFraction * radius), Scalar(0), FILLED);
 
-        Point2f tablePoint = analysis.geometry.toTable(centre);
-        if (!isInsideTable(tablePoint)) continue;
-        bool tooClose = false;
-        for (const Detection& other : analysis.detections)
-            if (hypot(other.tablePosition.x - tablePoint.x, other.tablePosition.y - tablePoint.y) < minimumBallSeparation) tooClose = true;
-        if (tooClose) continue;
+            Point2f tablePoint = analysis.geometry.toTable(centre);
+            if (!isInsideTable(tablePoint)) continue;
+            bool tooClose = false;
+            for (const Detection& other : analysis.detections)
+                if (hypot(other.tablePosition.x - tablePoint.x, other.tablePosition.y - tablePoint.y) < minimumBallSeparation) tooClose = true;
+            if (tooClose) continue;
 
-        double coverage = discCoverage(analysis.foreground, centre, coverageDiscRadiusFraction * radius);
-        if (coverage < minimumNonClothCoverage) continue;
+            double outlineScore = peakScore;
+            if (pass == 1) {
+                double visibleFraction = visibleOutline(centre, radius, analysis.detections, clothArea);
+                if (visibleFraction < minimumVisibleOutline) continue;
+                outlineScore = peakScore / visibleFraction;
+            }
+            if (outlineScore < minimumOutlineScore) continue;
 
-        Detection detection;
-        detection.imagePosition = centre;
-        detection.tablePosition = tablePoint;
-        detection.radius = radius;
-        detection.outlineScore = peakScore;
-        analysis.detections.push_back(detection);
+            double coverage = discCoverage(analysis.foreground, centre, coverageDiscRadiusFraction * radius);
+            if (coverage < minimumNonClothCoverage) continue;
+
+            Detection detection;
+            detection.imagePosition = centre;
+            detection.tablePosition = tablePoint;
+            detection.radius = radius;
+            detection.outlineScore = outlineScore;
+            analysis.detections.push_back(detection);
+        }
     }
     return analysis;
 }
