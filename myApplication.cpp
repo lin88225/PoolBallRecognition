@@ -744,9 +744,61 @@ ImageEvaluation evaluate(const ImageAnalysis& analysis, int imageIndex, int name
     return evaluation;
 }
 
+void drawLabel(Mat& picture, const string& text, Point origin, double scale, Scalar colour, int thickness = 2) {
+    putText(picture, text, origin, FONT_HERSHEY_SIMPLEX, scale, Scalar(0, 0, 0), thickness + 2);
+    putText(picture, text, origin, FONT_HERSHEY_SIMPLEX, scale, colour, thickness);
+}
+
+// Draws results on image. Green is right, orange is found but misnamed with true ball in
+// brackets, red is a false detection and a blue cross is a missed ball
+Mat overlayResults(const ImageAnalysis& analysis, const ImageEvaluation& evaluation, int imageIndex) {
+    Mat overlay = analysis.image.clone();
+    for (size_t index = 0; index < analysis.detections.size(); index++) {
+        const Detection& detection = analysis.detections[index];
+        int status = evaluation.detectionStatus[index];
+        Scalar colour = status == 0 ? Scalar(0, 220, 0) : (status == 1 ? Scalar(0, 140, 255) : Scalar(0, 0, 255));
+        circle(overlay, Point(detection.imagePosition), cvRound(detection.radius), colour, 2);
+        string text = detection.predictedBall >= 0 ? ballName(detection.predictedBall) : "?";
+        if (status == 1 && evaluation.detectionTruth[index] >= 0) text += " (" + ballName(evaluation.detectionTruth[index]) + ")";
+        Size textSize = getTextSize(text, FONT_HERSHEY_SIMPLEX, 0.8, 2, 0);
+        drawLabel(overlay, text, Point(cvRound(detection.imagePosition.x - textSize.width / 2.0), cvRound(detection.imagePosition.y - detection.radius - 6)), 0.8, colour);
+    }
+    for (int ball : evaluation.missedBalls) {
+        Point2f position = analysis.geometry.toImage(Point2f((float)groundTruth[imageIndex][ball][1], (float)groundTruth[imageIndex][ball][0]));
+        drawMarker(overlay, Point(position), Scalar(255, 120, 0), MARKER_CROSS, 24, 3);
+        drawLabel(overlay, ballName(ball), Point(cvRound(position.x) + 12, cvRound(position.y) + 28), 0.8, Scalar(255, 160, 0));
+    }
+    return overlay;
+}
+
+string outputPath(const string& fileName) {
+    return outputFolder + "/" + fileName;
+}
+
+void writeDetectionList(const vector<ImageAnalysis>& analyses, const vector<ImageEvaluation>& evaluations) {
+    ofstream file(outputPath("detections.csv"));
+    if (!file) {
+        cout << "couldnt write " << outputPath("detections.csv") << endl;
+        return;
+    }
+    file << "image,row,column,predicted_ball,status,true_ball,outer_ring_white,dark,hue,saturation,value,outline_score\n";
+    const char* statusNames[3] = { "correct", "wrong_name", "false_detection" };
+    for (int image = 0; image < 7; image++)
+        for (size_t index = 0; index < analyses[image].detections.size(); index++) {
+            const Detection& detection = analyses[image].detections[index];
+            file << imageNames[image] << "," << formatNumber(detection.tablePosition.y) << "," << formatNumber(detection.tablePosition.x) << ","
+                 << ballName(detection.predictedBall) << "," << statusNames[evaluations[image].detectionStatus[index]] << ","
+                 << (evaluations[image].detectionTruth[index] >= 0 ? ballName(evaluations[image].detectionTruth[index]) : "-") << ","
+                 << formatNumber(detection.features.outerRingWhiteFraction, 3) << "," << formatNumber(detection.features.darkFraction, 3) << ","
+                 << formatNumber(detection.features.hue, 0) << "," << formatNumber(detection.features.saturation, 0) << ","
+                 << formatNumber(detection.features.value, 0) << "," << formatNumber(detection.outlineScore, 2) << "\n";
+        }
+}
+
 }
 
 void MyApplication() {
+    utils::fs::createDirectories(outputFolder);
     Mat trainingImage = loadImage(imageFileNames[0]);
     if (trainingImage.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
     ImageAnalysis training = analyseImage(trainingImage, imageNames[0]);
@@ -760,6 +812,8 @@ void MyApplication() {
         trainingFeatures[ball] = extractFeatures(training, centre, training.geometry.radiusAt(centre), whiteSaturationLimit);
     }
     Classifier classifier = trainClassifier(trainingFeatures);
+    vector<ImageAnalysis> analyses(7);
+    vector<ImageEvaluation> evaluations(7);
 
     for (int image = 0; image < 7; image++) {
         Mat picture = loadImage(imageFileNames[image]);
@@ -773,5 +827,9 @@ void MyApplication() {
         ImageEvaluation evaluation = evaluate(analysis, image, nameCounts);
         cout << imageNames[image] << "  true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
              << ", missed " << evaluation.falseNegatives << ", named correctly " << evaluation.correctNames << " of " << evaluation.located << endl;
+        imwrite(outputPath(string("result_") + imageNames[image] + ".png"), overlayResults(analysis, evaluation, image));
+        analyses[image] = analysis;
+        evaluations[image] = evaluation;
     }
+    writeDetectionList(analyses, evaluations);
 }
