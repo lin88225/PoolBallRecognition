@@ -86,6 +86,9 @@ const double clothRingInnerRadiusFraction = 1.3;
 const double clothRingOuterRadiusFraction = 2.3;
 const size_t minimumClothRingPixelCount = 30;
 
+// How close (as a fraction of radius) a training circle must be to snap a label to it
+const double trainingSnapRadiusFraction = 0.8;
+
 const double matchTolerance = ballRadius;
 
 // Ground truth as row and column in table coordinates, with -1 for a ball that isn't on table.
@@ -775,6 +778,82 @@ string outputPath(const string& fileName) {
     return outputFolder + "/" + fileName;
 }
 
+struct Training {
+    ImageAnalysis analysis;
+    vector<BallFeatures> features;
+    vector<Point2f> centres;
+    vector<float> radii;
+    double whiteSaturationLimit = smallestWhiteSaturationLimit;
+    Classifier classifier;
+};
+
+// Trains on AllBalls. Each annotated ball is moved to nearest detected circle when one is close,
+// White limit is learned from cue ball and features of all sixteen balls set classifier
+Training trainOnAllBalls(const Mat& trainingImage) {
+    Training training;
+    training.analysis = analyseImage(trainingImage, imageNames[0]);
+    training.centres.resize(ballCount);
+    training.radii.resize(ballCount);
+    for (int ball = 0; ball < ballCount; ball++) {
+        Point2f centre = training.analysis.geometry.toImage(Point2f((float)groundTruth[0][ball][1], (float)groundTruth[0][ball][0]));
+        float radius = training.analysis.geometry.radiusAt(centre);
+        double closest = trainingSnapRadiusFraction * radius;
+        for (const Detection& detection : training.analysis.detections) {
+            double gap = hypot(detection.imagePosition.x - centre.x, detection.imagePosition.y - centre.y);
+            if (gap < closest) { closest = gap; centre = detection.imagePosition; }
+        }
+        training.centres[ball] = centre;
+        training.radii[ball] = radius;
+    }
+    training.whiteSaturationLimit = learnWhiteSaturationLimit(training.analysis, training.centres[15], training.radii[15]);
+    training.features.resize(ballCount);
+    for (int ball = 0; ball < ballCount; ball++)
+        training.features[ball] = extractFeatures(training.analysis, training.centres[ball], training.radii[ball], training.whiteSaturationLimit);
+    training.classifier = trainClassifier(training.features);
+    return training;
+}
+
+struct Totals {
+    int truePositives = 0, falsePositives = 0, falseNegatives = 0, groundTruthCount = 0, detectionCount = 0;
+    int located = 0, correctNames = 0, correctTypes = 0;
+    vector<double> errors;
+    double precision = 0, recall = 0, fScore = 0;
+    double errorMean = 0, errorMedian = 0, errorRootMeanSquare = 0, errorMaximum = 0;
+    double accuracy = 0, endToEndAccuracy = 0, typeAccuracy = 0;
+};
+
+void addToTotals(Totals& totals, const ImageEvaluation& evaluation) {
+    totals.truePositives += evaluation.truePositives;
+    totals.falsePositives += evaluation.falsePositives;
+    totals.falseNegatives += evaluation.falseNegatives;
+    totals.groundTruthCount += evaluation.groundTruthCount;
+    totals.detectionCount += evaluation.detectionCount;
+    totals.located += evaluation.located;
+    totals.correctNames += evaluation.correctNames;
+    totals.correctTypes += evaluation.correctTypes;
+    totals.errors.insert(totals.errors.end(), evaluation.errors.begin(), evaluation.errors.end());
+}
+
+void finishTotals(Totals& totals) {
+    totals.precision = totals.detectionCount ? (double)totals.truePositives / totals.detectionCount : 0;
+    totals.recall = totals.groundTruthCount ? (double)totals.truePositives / totals.groundTruthCount : 0;
+    totals.fScore = (totals.precision + totals.recall) > 0 ? 2 * totals.precision * totals.recall / (totals.precision + totals.recall) : 0;
+    if (!totals.errors.empty()) {
+        for (double error : totals.errors) {
+            totals.errorMean += error;
+            totals.errorRootMeanSquare += error * error;
+            totals.errorMaximum = max(totals.errorMaximum, error);
+        }
+        totals.errorMean /= totals.errors.size();
+        totals.errorRootMeanSquare = sqrt(totals.errorRootMeanSquare / totals.errors.size());
+        vector<float> errorCopy(totals.errors.begin(), totals.errors.end());
+        totals.errorMedian = medianValue(errorCopy);
+    }
+    totals.accuracy = totals.located ? (double)totals.correctNames / totals.located : 0;
+    totals.endToEndAccuracy = totals.groundTruthCount ? (double)totals.correctNames / totals.groundTruthCount : 0;
+    totals.typeAccuracy = totals.located ? (double)totals.correctTypes / totals.located : 0;
+}
+
 void writeDetectionList(const vector<ImageAnalysis>& analyses, const vector<ImageEvaluation>& evaluations) {
     ofstream file(outputPath("detections.csv"));
     if (!file) {
@@ -795,41 +874,97 @@ void writeDetectionList(const vector<ImageAnalysis>& analyses, const vector<Imag
         }
 }
 
+// Prints located balls of one image in table coordinates (row, column in millimetres) with
+// name given to each, then how they compare with ground truth
+void printImageResults(const ImageAnalysis& analysis, const ImageEvaluation& evaluation) {
+    cout << analysis.name << " balls found";
+    for (const Detection& detection : analysis.detections)
+        cout << "  " << ballName(detection.predictedBall) << " (" << cvRound(detection.tablePosition.y) << "," << cvRound(detection.tablePosition.x) << ")";
+    cout << endl;
+    cout << analysis.name << "  on table " << evaluation.groundTruthCount << ", found " << evaluation.detectionCount
+         << ", true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
+         << ", missed " << evaluation.falseNegatives << ", named correctly " << evaluation.correctNames << " of " << evaluation.located << endl;
 }
 
-void MyApplication() {
-    utils::fs::createDirectories(outputFolder);
-    Mat trainingImage = loadImage(imageFileNames[0]);
-    if (trainingImage.empty()) { cout << "couldn't find " << imageFileNames[0] << endl; return; }
-    ImageAnalysis training = analyseImage(trainingImage, imageNames[0]);
+// Everything the run works out. The report program reads this too
+struct Results {
+    bool trained = false;
+    Training training;
+    vector<ImageAnalysis> analyses = vector<ImageAnalysis>(7);
+    vector<ImageEvaluation> evaluations = vector<ImageEvaluation>(7);
+    vector<Mat> overlays = vector<Mat>(7);
+    Totals totals;
+    int tableNameCounts[ballCount][ballCount] = {};
+    int trainingNameCounts[ballCount][ballCount] = {};
+};
 
-    // Features of the 16 balls in AllBalls, taken at the spreadsheet positions
-    Point2f cueCentre = training.geometry.toImage(Point2f((float)groundTruth[0][15][1], (float)groundTruth[0][15][0]));
-    double whiteSaturationLimit = learnWhiteSaturationLimit(training, cueCentre, training.geometry.radiusAt(cueCentre));
-    vector<BallFeatures> trainingFeatures(ballCount);
-    for (int ball = 0; ball < ballCount; ball++) {
-        Point2f centre = training.geometry.toImage(Point2f((float)groundTruth[0][ball][1], (float)groundTruth[0][ball][0]));
-        trainingFeatures[ball] = extractFeatures(training, centre, training.geometry.radiusAt(centre), whiteSaturationLimit);
+// Trains on AllBalls then locates, names and evaluates the balls in every image
+Results analyseAllImages() {
+    Results results;
+    Mat trainingImage = loadImage(imageFileNames[0]);
+    if (trainingImage.empty()) {
+        cout << "couldn't find " << imageFileNames[0] << endl;
+        return results;
     }
-    Classifier classifier = trainClassifier(trainingFeatures);
-    vector<ImageAnalysis> analyses(7);
-    vector<ImageEvaluation> evaluations(7);
+    results.training = trainOnAllBalls(trainingImage);
+    results.trained = true;
+    const Training& training = results.training;
+    cout << "Trained. Cue threshold " << formatNumber(training.classifier.cueThreshold, 2) << ", black threshold "
+         << formatNumber(training.classifier.blackThreshold, 2) << ", stripe threshold " << formatNumber(training.classifier.stripeThreshold, 2) << endl;
 
     for (int image = 0; image < 7; image++) {
-        Mat picture = loadImage(imageFileNames[image]);
-        if (picture.empty()) { cout << "couldn't find " << imageFileNames[image] << endl; continue; }
-        ImageAnalysis analysis = analyseImage(picture, imageNames[image]);
-        for (Detection& detection : analysis.detections) {
-            detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, whiteSaturationLimit);
-            detection.predictedBall = classify(classifier, detection.features);
+        Mat picture = (image == 0) ? trainingImage : loadImage(imageFileNames[image]);
+        if (picture.empty()) {
+            cout << "couldn't find " << imageFileNames[image] << ", skipped" << endl;
+            continue;
         }
-        int nameCounts[ballCount][ballCount] = {};
-        ImageEvaluation evaluation = evaluate(analysis, image, nameCounts);
-        cout << imageNames[image] << "  true positives " << evaluation.truePositives << ", false positives " << evaluation.falsePositives
-             << ", missed " << evaluation.falseNegatives << ", named correctly " << evaluation.correctNames << " of " << evaluation.located << endl;
-        imwrite(outputPath(string("result_") + imageNames[image] + ".png"), overlayResults(analysis, evaluation, image));
-        analyses[image] = analysis;
-        evaluations[image] = evaluation;
+        results.analyses[image] = (image == 0) ? training.analysis : analyseImage(picture, imageNames[image]);
+        ImageAnalysis& analysis = results.analyses[image];
+        for (Detection& detection : analysis.detections) {
+            detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, training.whiteSaturationLimit);
+            detection.predictedBall = classify(training.classifier, detection.features);
+        }
+        results.evaluations[image] = evaluate(analysis, image, image == 0 ? results.trainingNameCounts : results.tableNameCounts);
+        printImageResults(analysis, results.evaluations[image]);
+        cout << "DEBUG " << analysis.name << " cloth hue " << analysis.cloth.hue << endl;
+        results.overlays[image] = overlayResults(analysis, results.evaluations[image], image);
+        // imshow("overlay", results.overlays[image]);
+        if (image > 0) addToTotals(results.totals, results.evaluations[image]);
     }
-    writeDetectionList(analyses, evaluations);
+    finishTotals(results.totals);
+    return results;
+}
+
+}
+
+// Locates and recognises balls in every image, evaluates both stages against ground truth and
+// writes result pictures and a list of detections to output folder
+void MyApplication() {
+    utils::fs::createDirectories(outputFolder);
+    // TODO check the folder names work on the lab computers
+    Results results = analyseAllImages();
+    if (!results.trained) return;
+    const Totals& totals = results.totals;
+
+    cout << "\nStage 1 over Table1 to Table6\n  precision " << formatPercentage(totals.precision) << "%  recall " << formatPercentage(totals.recall)
+         << "%  F1 " << formatPercentage(totals.fScore) << "%\n  error mean " << formatNumber(totals.errorMean) << " mm, median "
+         << formatNumber(totals.errorMedian) << " mm, root mean square " << formatNumber(totals.errorRootMeanSquare) << " mm, maximum "
+         << formatNumber(totals.errorMaximum) << " mm\nStage 2\n  accuracy on located balls " << formatPercentage(totals.accuracy)
+         << "%, end to end " << formatPercentage(totals.endToEndAccuracy) << "%, type accuracy " << formatPercentage(totals.typeAccuracy) << "%" << endl;
+
+    for (int image = 0; image < 7; image++)
+        if (!results.overlays[image].empty()) imwrite(outputPath(string("result_") + imageNames[image] + ".png"), results.overlays[image]);
+    writeDetectionList(results.analyses, results.evaluations);
+
+    if (showWindows) {
+        try {
+            for (int image = 1; image <= 6; image++)
+                if (!results.overlays[image].empty()) imshow(imageNames[image], results.overlays[image]);
+            cout << "Press a key in a picture window to finish." << endl;
+            waitKey(0);
+            destroyAllWindows();
+        } catch (const cv::Exception&) {
+            cout << "no display, pictures are in " << outputFolder << endl;
+        }
+    }
 }
