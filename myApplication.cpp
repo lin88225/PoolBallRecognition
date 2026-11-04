@@ -557,14 +557,14 @@ Classifier trainClassifier(const vector<BallFeatures>& features) {
     double mostWhiteOther = 0;
     for (int ball = 0; ball < 15; ball++) mostWhiteOther = max(mostWhiteOther, features[ball].outerRingWhiteFraction);
     classifier.cueThreshold = features[15].outerRingWhiteFraction > mostWhiteOther
-        ? (features[15].outerRingWhiteFraction + mostWhiteOther) / 2 : 0.9 * features[15].outerRingWhiteFraction;
+        ? sqrt(features[15].outerRingWhiteFraction * mostWhiteOther) : 0.9 * features[15].outerRingWhiteFraction;
     double mostDarkOther = 0;
     for (int ball = 0; ball < 15; ball++) if (ball != 7) mostDarkOther = max(mostDarkOther, features[ball].darkFraction);
     classifier.blackThreshold = features[7].darkFraction > mostDarkOther
-        ? (features[7].darkFraction + mostDarkOther) / 2 : 0.5 * features[7].darkFraction;
+        ? sqrt(features[7].darkFraction * mostDarkOther) : 0.5 * features[7].darkFraction;
     double solidWhite = meanOfFeature(features, 0, 6, &BallFeatures::outerRingWhiteFraction);
     double stripeWhite = meanOfFeature(features, 8, 14, &BallFeatures::outerRingWhiteFraction);
-    classifier.stripeThreshold = (solidWhite + stripeWhite) / 2;
+    classifier.stripeThreshold = sqrt(solidWhite * stripeWhite);
     for (int ball = 0; ball < 15; ball++) classifier.prototypes[ball] = features[ball];
     return classifier;
 }
