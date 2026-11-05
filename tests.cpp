@@ -124,7 +124,7 @@ static Mat flatHsv(Size size, Vec3b value) {
 static void testClothModelFindsFlatColour() {
     Mat hsv = flatHsv(Size(120, 120), Vec3b(60, 150, 200));
     Mat inner(hsv.size(), CV_8U, Scalar(255));
-    ClothModel cloth = estimateCloth(hsv, inner);
+    ClothModel cloth = estimateCloth(hsv, inner, "test");
     CHECK_NEAR(cloth.hue, 60, 1.0);
     CHECK_NEAR(cloth.saturation, 150, 1.0);
     CHECK_NEAR(cloth.brightness, 200, 1.0);

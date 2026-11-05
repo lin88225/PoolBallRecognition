@@ -171,9 +171,23 @@ Mat loadImage(const string& fileName) {
         if (utils::fs::exists(path)) {
             Mat image = imread(path, IMREAD_COLOR);
             if (!image.empty()) return image;
+            cout << "Couldn't read " << path << endl;
         }
     }
     return Mat();
+}
+
+// Writes a picture and says so when that fails, so a missing figure isn't a surprise later
+void writePicture(const string& path, const Mat& picture) {
+    bool written = false;
+    try {
+        written = imwrite(path, picture);
+    } catch (const exception& error) {
+        cout << "couldn't write " << path << endl;
+        return;
+    }
+    if (!written)
+        cout << "couldn't write " << path << endl;
 }
 
 // Mapping between camera image and table and radius a ball is expected to have at
@@ -263,7 +277,8 @@ void iterativeMeanAndDeviation(const vector<float>& values, float startHalfWidth
 // The cloth's hue is peak of a smoothed hue histogram of middle of table hue and
 // saturation tolerances come from their spread. A shadow mainly lowers brightness and leaves hue and
 // saturation nearly unchanged, so shadowed cloth still counts as cloth.
-ClothModel estimateCloth(const Mat& hsvImage, const Mat& innerMask) {
+// A cloth model that looks wrong is reported and used anyway, so rest of run still shows what happens
+ClothModel estimateCloth(const Mat& hsvImage, const Mat& innerMask, const string& name) {
     ClothModel cloth;
     vector<float> brightnessValues;
     for (int row = 0; row < hsvImage.rows; row += 2)
@@ -285,11 +300,15 @@ ClothModel estimateCloth(const Mat& hsvImage, const Mat& innerMask) {
     double peakHeight;
     minMaxLoc(smoothed.rowRange(2, 182), 0, &peakHeight, 0, &peak);
     cloth.hue = (float)peak.y;
+    if (!(peakHeight > 0))
+        cout << name << " has no cloth hue peak" << endl;
 
     vector<Vec3b> clothPixels;
     for (int row = 0; row < hsvImage.rows; row += 2)
         for (int column = 0; column < hsvImage.cols; column += 2)
             if (histogramMask.at<uchar>(row, column)) clothPixels.push_back(hsvImage.at<Vec3b>(row, column));
+    if ((int)clothPixels.size() < minimumClothPixelCount)
+        cout << name << " has only " << clothPixels.size() << " cloth pixels" << endl;
 
     vector<float> hueDifferences;
     for (const Vec3b& pixel : clothPixels) hueDifferences.push_back((float)hueDifference(pixel[0], cloth.hue));
@@ -580,16 +599,26 @@ double meanOfFeature(const vector<BallFeatures>& features, int firstBall, int la
 // outer ring white fraction is used for cue ball and for stripes
 Classifier trainClassifier(const vector<BallFeatures>& features) {
     Classifier classifier;
+    if ((int)features.size() != ballCount) {
+        cout << "Training got " << features.size() << " ball features instead of " << ballCount << endl;
+        return classifier;
+    }
     double mostWhiteOther = 0;
     for (int ball = 0; ball < 15; ball++) mostWhiteOther = max(mostWhiteOther, features[ball].outerRingWhiteFraction);
+    if (!(features[15].outerRingWhiteFraction > mostWhiteOther))
+        cout << "cue threshold fell back to default" << endl;
     classifier.cueThreshold = features[15].outerRingWhiteFraction > mostWhiteOther
         ? sqrt(features[15].outerRingWhiteFraction * mostWhiteOther) : 0.9 * features[15].outerRingWhiteFraction;
     double mostDarkOther = 0;
     for (int ball = 0; ball < 15; ball++) if (ball != 7) mostDarkOther = max(mostDarkOther, features[ball].darkFraction);
+    if (!(features[7].darkFraction > mostDarkOther))
+        cout << "black threshold fell back to default" << endl;
     classifier.blackThreshold = features[7].darkFraction > mostDarkOther
         ? sqrt(features[7].darkFraction * mostDarkOther) : 0.5 * features[7].darkFraction;
     double solidWhite = meanOfFeature(features, 0, 6, &BallFeatures::outerRingWhiteFraction);
     double stripeWhite = meanOfFeature(features, 8, 14, &BallFeatures::outerRingWhiteFraction);
+    if (!(stripeWhite > solidWhite))
+        cout << "stripe threshold unreliable" << endl;
     classifier.stripeThreshold = sqrt(solidWhite * stripeWhite);
     for (int ball = 0; ball < 15; ball++) classifier.prototypes[ball] = features[ball];
     return classifier;
@@ -644,7 +673,7 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
     cvtColor(image, analysis.hsvImage, COLOR_BGR2HSV);
 
     Mat innerMask = tableMask(image.size(), innerClothGrowth);
-    analysis.cloth = estimateCloth(analysis.hsvImage, innerMask);
+    analysis.cloth = estimateCloth(analysis.hsvImage, innerMask, name);
     analysis.clothDistanceImage = clothDistance(analysis.hsvImage, analysis.cloth);
     analysis.foreground = (analysis.clothDistanceImage > 1.f);
     analysis.foreground.convertTo(analysis.foreground, CV_8U);
@@ -663,6 +692,7 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
         Mat remainingScore = analysis.score.clone();
         remainingScore.setTo(0, searchArea == 0);
         double lowestPeak = pass == 0 ? minimumOutlineScore : minimumSecondPassScore;
+        int rejectedCount = 0;
         for (int attempt = 0; attempt < attemptsPerBall * maximumBallCount && (int)analysis.detections.size() < maximumBallCount; attempt++) {
             double peakScore;
             Point peakLocation;
@@ -681,22 +711,22 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
             circle(remainingScore, peakLocation, cvRound(peakClearingRadiusFraction * radius), Scalar(0), FILLED);
 
             Point2f tablePoint = analysis.geometry.toTable(centre);
-            if (!isInsideTable(tablePoint)) continue;
+            if (!isInsideTable(tablePoint)) { rejectedCount++; continue; }
             bool tooClose = false;
             for (const Detection& other : analysis.detections)
                 if (hypot(other.tablePosition.x - tablePoint.x, other.tablePosition.y - tablePoint.y) < minimumBallSeparation) tooClose = true;
-            if (tooClose) continue;
+            if (tooClose) { rejectedCount++; continue; }
 
             double outlineScore = peakScore;
             if (pass == 1) {
                 double visibleFraction = visibleOutline(centre, radius, analysis.detections, clothArea);
-                if (visibleFraction < minimumVisibleOutline) continue;
+                if (visibleFraction < minimumVisibleOutline) { rejectedCount++; continue; }
                 outlineScore = peakScore / visibleFraction;
             }
-            if (outlineScore < minimumOutlineScore) continue;
+            if (outlineScore < minimumOutlineScore) { rejectedCount++; continue; }
 
             double coverage = discCoverage(analysis.foreground, centre, coverageDiscRadiusFraction * radius);
-            if (coverage < minimumNonClothCoverage) continue;
+            if (coverage < minimumNonClothCoverage) { rejectedCount++; continue; }
 
             Detection detection;
             detection.imagePosition = centre;
@@ -705,7 +735,11 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
             detection.outlineScore = outlineScore;
             analysis.detections.push_back(detection);
         }
+        if (pass == 0 && rejectedCount > maximumBallCount)
+            cout << name << " had " << rejectedCount << " rejected circles" << endl;
     }
+    if (analysis.detections.empty())
+        cout << name << " gave no detections" << endl;
     return analysis;
 }
 
@@ -827,17 +861,22 @@ Training trainOnAllBalls(const Mat& trainingImage) {
     training.analysis = analyseImage(trainingImage, imageNames[0]);
     training.centres.resize(ballCount);
     training.radii.resize(ballCount);
+    int snappedCount = 0;
     for (int ball = 0; ball < ballCount; ball++) {
         Point2f centre = training.analysis.geometry.toImage(Point2f((float)groundTruth[0][ball][1], (float)groundTruth[0][ball][0]));
         float radius = training.analysis.geometry.radiusAt(centre);
         double closest = trainingSnapRadiusFraction * radius;
+        bool snapped = false;
         for (const Detection& detection : training.analysis.detections) {
             double gap = hypot(detection.imagePosition.x - centre.x, detection.imagePosition.y - centre.y);
-            if (gap < closest) { closest = gap; centre = detection.imagePosition; }
+            if (gap < closest) { closest = gap; centre = detection.imagePosition; snapped = true; }
         }
+        if (snapped) snappedCount++;
         training.centres[ball] = centre;
         training.radii[ball] = radius;
     }
+    if (snappedCount < ballCount)
+        cout << "only " << snappedCount << " of " << ballCount << " training balls matched detected circle" << endl;
     training.whiteSaturationLimit = learnWhiteSaturationLimit(training.analysis, training.centres[15], training.radii[15]);
     training.features.resize(ballCount);
     for (int ball = 0; ball < ballCount; ball++)
@@ -1016,7 +1055,8 @@ Results analyseAllImages() {
 // Locates and recognises balls in every image, evaluates both stages against ground truth and
 // writes result pictures and a list of detections to output folder
 void MyApplication() {
-    utils::fs::createDirectories(outputFolder);
+    if (!utils::fs::createDirectories(outputFolder) && !utils::fs::isDirectory(outputFolder))
+        cout << "couldn't make " << outputFolder << endl;
     // TODO check the folder names work on the lab computers
     Results results = analyseAllImages();
     if (!results.trained) return;
@@ -1029,7 +1069,7 @@ void MyApplication() {
          << "%, end to end " << formatPercentage(totals.endToEndAccuracy) << "%, type accuracy " << formatPercentage(totals.typeAccuracy) << "%" << endl;
 
     for (int image = 0; image < 7; image++)
-        if (!results.overlays[image].empty()) imwrite(outputPath(string("result_") + imageNames[image] + ".png"), results.overlays[image]);
+        if (!results.overlays[image].empty()) writePicture(outputPath(string("result_") + imageNames[image] + ".png"), results.overlays[image]);
     writeDetectionList(results.analyses, results.evaluations);
 
     if (showWindows) {
