@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -28,6 +29,10 @@ const int ballCount = 16;
 
 const bool showWindows = true;
 const string outputFolder = "output";
+
+// Size of AllBalls and so of every image, because corners below only fit this size
+const int expectedImageWidth = 1931;
+const int expectedImageHeight = 509;
 
 const Point2f imageCorners[4] = { Point2f(337, 35), Point2f(38, 472), Point2f(1570, 21), Point2f(1888, 451) };
 const Point2f tableCorners[4] = { Point2f(0, 0), Point2f(0, tableRows - 1), Point2f(tableColumns - 1, 0), Point2f(tableColumns - 1, tableRows - 1) };
@@ -137,7 +142,21 @@ double medianValue(vector<float>& values) {
     return values[middle];
 }
 
+// Stage analysis of current image has reached, so an error can say where it happened
+string currentStage = "start";
+
+// True when a matrix has values and none of them are NaN or infinite
+bool isUsableMatrix(const Mat& matrix) {
+    return !matrix.empty() && checkRange(matrix);
+}
+
+// Stops analysis of one image with a message, which caller prints with image name and stage
+void failWith(const string& message) {
+    throw runtime_error(message);
+}
+
 Point2f applyHomography(const Mat& homography, Point2f point) {
+    if (!isUsableMatrix(homography)) failWith("Table mapping is empty/has NaN values");
     vector<Point2f> points = { point }, transformed;
     perspectiveTransform(points, transformed, homography);
     return transformed[0];
@@ -181,6 +200,8 @@ Geometry buildGeometry(Size imageSize) {
     vector<Point2f> imagePoints(imageCorners, imageCorners + 4), tablePoints(tableCorners, tableCorners + 4);
     geometry.imageToTable = getPerspectiveTransform(imagePoints, tablePoints);
     geometry.tableToImage = geometry.imageToTable.inv();
+    if (!isUsableMatrix(geometry.imageToTable) || !isUsableMatrix(geometry.tableToImage) || countNonZero(geometry.tableToImage) == 0)
+        failWith("table mapping can't build from the corners");
     geometry.expectedRadius.create(imageSize, CV_32F);
     vector<Point2f> imageRow(imageSize.width), tableRow, nextImageRow;
     for (int row = 0; row < imageSize.height; row++) {
@@ -353,6 +374,11 @@ EdgeImages computeEdges(const Mat& image, const Mat& regionMask) {
 // votes are smoothed and divided by circumferenece so a complete circle scores about 1.
 // Division is done in double precision so every pixel rounds exactly as a plain float division does
 Mat circleScore(const EdgeImages& edgeImages, const Mat& expectedRadius) {
+    if (edgeImages.edges.empty() || !isUsableMatrix(edgeImages.magnitude) || !isUsableMatrix(edgeImages.gradientX) ||
+        !isUsableMatrix(edgeImages.gradientY))
+        failWith("Edge images are empty or have NaN values");
+    if (!isUsableMatrix(expectedRadius) || expectedRadius.size() != edgeImages.edges.size())
+        failWith("Expected radius image is unusable");
     Size imageSize = edgeImages.edges.size();
     Mat votes = Mat::zeros(imageSize, CV_32F);
     const float voteWeight = 1.f / voteRadiusCount;
@@ -612,7 +638,9 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
     ImageAnalysis analysis;
     analysis.name = name;
     analysis.image = image;
+    currentStage = "geometry";
     analysis.geometry = buildGeometry(image.size());
+    currentStage = "cloth";
     cvtColor(image, analysis.hsvImage, COLOR_BGR2HSV);
 
     Mat innerMask = tableMask(image.size(), innerClothGrowth);
@@ -623,9 +651,12 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
     morphologyEx(analysis.foreground, analysis.foreground, MORPH_OPEN, getStructuringElement(MORPH_ELLIPSE, Size(3, 3)));
     morphologyEx(analysis.foreground, analysis.foreground, MORPH_CLOSE, getStructuringElement(MORPH_ELLIPSE, Size(5, 5)));
 
+    currentStage = "edges";
     analysis.edges = computeEdges(image, tableMask(image.size(), edgeRegionGrowth));
+    currentStage = "circles";
     analysis.score = circleScore(analysis.edges, analysis.geometry.expectedRadius);
 
+    currentStage = "picking";
     Mat searchArea = tableMask(image.size(), searchAreaGrowth);
     Mat clothArea = tableMask(image.size(), 0);
     for (int pass = 0; pass < 2; pass++) {
@@ -636,6 +667,7 @@ ImageAnalysis analyseImage(const Mat& image, const string& name) {
             double peakScore;
             Point peakLocation;
             minMaxLoc(remainingScore, 0, &peakScore, 0, &peakLocation);
+            if (peakLocation.x < 0 || peakLocation.y < 0 || !(peakScore == peakScore)) break;
             if (peakScore < lowestPeak) break;
             float radius = analysis.geometry.radiusAt(Point2f(peakLocation));
             Rect window = Rect(peakLocation.x - centreWindowHalfSize, peakLocation.y - centreWindowHalfSize,
@@ -927,7 +959,15 @@ Results analyseAllImages() {
         cout << "couldn't find " << imageFileNames[0] << endl;
         return results;
     }
-    results.training = trainOnAllBalls(trainingImage);
+    if (trainingImage.cols != expectedImageWidth || trainingImage.rows != expectedImageHeight)
+        cout << imageFileNames[0] << " wrong size" << endl;
+    try {
+        currentStage = "start";
+        results.training = trainOnAllBalls(trainingImage);
+    } catch (const exception& error) {
+        cout << imageNames[0] << " failed at " << currentStage << " (" << error.what() << ")" << endl;
+        return results;
+    }
     results.trained = true;
     const Training& training = results.training;
     cout << "Trained. Cue threshold " << formatNumber(training.classifier.cueThreshold, 2) << ", black threshold "
@@ -939,19 +979,33 @@ Results analyseAllImages() {
             cout << "couldn't find " << imageFileNames[image] << ", skipped" << endl;
             continue;
         }
-        results.analyses[image] = (image == 0) ? training.analysis : analyseImage(picture, imageNames[image]);
-        ImageAnalysis& analysis = results.analyses[image];
-        for (Detection& detection : analysis.detections) {
-            detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, training.whiteSaturationLimit);
-            detection.predictedBall = classify(training.classifier, detection.features);
+        if (picture.size() != trainingImage.size()) {
+            cout << imageFileNames[image] << " has the wrong size, skipped" << endl;
+            continue;
         }
-        makeNamesUnique(analysis.detections, training.classifier);
-        results.evaluations[image] = evaluate(analysis, image, image == 0 ? results.trainingNameCounts : results.tableNameCounts);
-        printImageResults(analysis, results.evaluations[image]);
-        cout << "DEBUG " << analysis.name << " cloth hue " << analysis.cloth.hue << endl;
-        results.overlays[image] = overlayResults(analysis, results.evaluations[image], image);
-        // imshow("overlay", results.overlays[image]);
-        if (image > 0) addToTotals(results.totals, results.evaluations[image]);
+        try {
+            currentStage = "start";
+            results.analyses[image] = (image == 0) ? training.analysis : analyseImage(picture, imageNames[image]);
+            ImageAnalysis& analysis = results.analyses[image];
+            currentStage = "features";
+            for (Detection& detection : analysis.detections) {
+                detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, training.whiteSaturationLimit);
+                detection.predictedBall = classify(training.classifier, detection.features);
+            }
+            makeNamesUnique(analysis.detections, training.classifier);
+            currentStage = "evaluation";
+            results.evaluations[image] = evaluate(analysis, image, image == 0 ? results.trainingNameCounts : results.tableNameCounts);
+            printImageResults(analysis, results.evaluations[image]);
+            cout << "DEBUG " << analysis.name << " cloth hue " << analysis.cloth.hue << endl;
+            results.overlays[image] = overlayResults(analysis, results.evaluations[image], image);
+            // imshow("overlay", results.overlays[image]);
+            if (image > 0) addToTotals(results.totals, results.evaluations[image]);
+        } catch (const exception& error) {
+            cout << imageNames[image] << " failed at " << currentStage << " (" << error.what() << "), skipped" << endl;
+            results.analyses[image] = ImageAnalysis();
+            results.evaluations[image] = ImageEvaluation();
+            results.overlays[image] = Mat();
+        }
     }
     finishTotals(results.totals);
     return results;
