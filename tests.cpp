@@ -278,6 +278,35 @@ static void testVisibleOutline() {
 }
 
 // ---------------------------------------------------------------------------
+// Wrong sized pictures and bad data
+// ---------------------------------------------------------------------------
+
+static void testOddTable3IsTheWrongSize() {
+    Mat odd = loadImage("weirdtable3/Table3.jpeg");
+    CHECK(!odd.empty());
+    CHECK(odd.cols != expectedImageWidth || odd.rows != expectedImageHeight);
+    Mat proper = loadImage(imageFileNames[3]);
+    CHECK(proper.cols == expectedImageWidth && proper.rows == expectedImageHeight);
+}
+
+static void testUsableMatrix() {
+    CHECK(!isUsableMatrix(Mat()));
+    CHECK(isUsableMatrix(Mat::eye(3, 3, CV_64F)));
+    Mat withNaN = Mat::eye(3, 3, CV_64F);
+    withNaN.at<double>(1, 1) = NAN;
+    CHECK(!isUsableMatrix(withNaN));
+}
+
+static void testBadMappingStopsTheImage() {
+    bool stopped = false;
+    try { applyHomography(Mat(), Point2f(1, 1)); } catch (const runtime_error&) { stopped = true; }
+    CHECK(stopped);
+    stopped = false;
+    try { failWith("test"); } catch (const runtime_error&) { stopped = true; }
+    CHECK(stopped);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     runTest("formatting", testFormatting);
@@ -308,6 +337,10 @@ int main() {
     runTest("colour distance", testColourDistance);
 
     runTest("visible outline", testVisibleOutline);
+
+    runTest("odd Table3 is the wrong size", testOddTable3IsTheWrongSize);
+    runTest("usable matrix", testUsableMatrix);
+    runTest("bad mapping stops the image", testBadMappingStopsTheImage);
     cout << "\n" << checkCount << " checks, " << failureCount << " failed" << endl;
     return failureCount == 0 ? 0 : 1;
 }
