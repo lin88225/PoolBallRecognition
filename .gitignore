@@ -1,0 +1,4 @@
+pool
+.vscode/
+output_baseline/
+.DS_Store
