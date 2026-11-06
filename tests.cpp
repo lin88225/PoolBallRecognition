@@ -307,6 +307,106 @@ static void testBadMappingStopsTheImage() {
 }
 
 // ---------------------------------------------------------------------------
+// Scoring
+// ---------------------------------------------------------------------------
+
+static ImageAnalysis analysisFromGroundTruth(int image) {
+    ImageAnalysis analysis;
+    for (int ball = 0; ball < ballCount; ball++) {
+        if (groundTruth[image][ball][0] < 0) continue;
+        Detection detection;
+        detection.tablePosition = Point2f((float)groundTruth[image][ball][1], (float)groundTruth[image][ball][0]);
+        detection.predictedBall = ball;
+        analysis.detections.push_back(detection);
+    }
+    return analysis;
+}
+
+static void testPerfectDetectionsScoreFully() {
+    int nameCounts[ballCount][ballCount] = {};
+    ImageEvaluation evaluation = evaluate(analysisFromGroundTruth(0), 0, nameCounts);
+    CHECK(evaluation.groundTruthCount == 16 && evaluation.detectionCount == 16);
+    CHECK(evaluation.truePositives == 16 && evaluation.falsePositives == 0 && evaluation.falseNegatives == 0);
+    CHECK(evaluation.correctNames == 16 && evaluation.correctTypes == 16);
+    for (int ball = 0; ball < ballCount; ball++) CHECK(nameCounts[ball][ball] == 1);
+}
+
+static void testExtraAndMissingBalls() {
+    ImageAnalysis analysis = analysisFromGroundTruth(0);
+    analysis.detections.pop_back();
+    Detection ghost;
+    ghost.tablePosition = Point2f(10, 10);
+    ghost.predictedBall = 3;
+    analysis.detections.push_back(ghost);
+    int nameCounts[ballCount][ballCount] = {};
+    ImageEvaluation evaluation = evaluate(analysis, 0, nameCounts);
+    CHECK(evaluation.truePositives == 15 && evaluation.falsePositives == 1 && evaluation.falseNegatives == 1);
+    CHECK(evaluation.missedBalls.size() == 1 && evaluation.missedBalls[0] == 15);
+    CHECK(evaluation.detectionStatus.back() == 2);
+}
+
+static void testWrongNameStillLocatesBall() {
+    ImageAnalysis analysis = analysisFromGroundTruth(0);
+    analysis.detections[0].predictedBall = 9;
+    int nameCounts[ballCount][ballCount] = {};
+    ImageEvaluation evaluation = evaluate(analysis, 0, nameCounts);
+    CHECK(evaluation.truePositives == 16 && evaluation.correctNames == 15);
+    CHECK(evaluation.detectionStatus[0] == 1);
+    CHECK(evaluation.correctTypes == 15);
+}
+
+static void testMatchToleranceIsOneBallRadius() {
+    ImageAnalysis analysis = analysisFromGroundTruth(0);
+    analysis.detections[0].tablePosition.x += (float)(matchTolerance - 1.0);
+    analysis.detections[1].tablePosition.x += (float)(matchTolerance + 5.0);
+    int nameCounts[ballCount][ballCount] = {};
+    ImageEvaluation evaluation = evaluate(analysis, 0, nameCounts);
+    CHECK(evaluation.truePositives == 15 && evaluation.falsePositives == 1 && evaluation.falseNegatives == 1);
+}
+
+static void testBallsOffTheTableAreNotCounted() {
+    int nameCounts[ballCount][ballCount] = {};
+    ImageEvaluation evaluation = evaluate(analysisFromGroundTruth(5), 5, nameCounts);
+    CHECK(evaluation.groundTruthCount < ballCount);
+    CHECK(evaluation.groundTruthCount == evaluation.detectionCount && evaluation.falseNegatives == 0);
+}
+
+static void testTotalsAddUp() {
+    int nameCounts[ballCount][ballCount] = {};
+    Totals totals;
+    addToTotals(totals, evaluate(analysisFromGroundTruth(1), 1, nameCounts));
+    addToTotals(totals, evaluate(analysisFromGroundTruth(2), 2, nameCounts));
+    finishTotals(totals);
+    CHECK(totals.truePositives == 32);
+    CHECK_NEAR(totals.precision, 1.0, 1e-9);
+    CHECK_NEAR(totals.recall, 1.0, 1e-9);
+    CHECK_NEAR(totals.errorMaximum, 0.0, 1e-9);
+}
+
+static void testGroundTruthBallsDoNotOverlap() {
+    for (int image = 0; image < 7; image++)
+        for (int first = 0; first < ballCount; first++)
+            for (int second = first + 1; second < ballCount; second++) {
+                if (groundTruth[image][first][0] < 0 || groundTruth[image][second][0] < 0) continue;
+                double gap = hypot(groundTruth[image][first][0] - groundTruth[image][second][0],
+                                   groundTruth[image][first][1] - groundTruth[image][second][1]);
+                if (gap < minimumBallSeparation)
+                    cout << "  " << imageNames[image] << " balls " << ballName(first) << " and " << ballName(second) << " are only " << gap << " apart" << endl;
+                CHECK(gap >= minimumBallSeparation);
+            }
+}
+
+static void testWholeRunLocatesBallsInEveryPicture() {
+    Results results = analyseAllImages();
+    CHECK(results.trained);
+    for (int image = 0; image < 7; image++) {
+        CHECK(!results.analyses[image].detections.empty());
+        CHECK((int)results.analyses[image].detections.size() <= maximumBallCount);
+    }
+    CHECK(results.totals.precision > 0.5 && results.totals.recall > 0.5);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     runTest("formatting", testFormatting);
@@ -341,6 +441,15 @@ int main() {
     runTest("odd Table3 is the wrong size", testOddTable3IsTheWrongSize);
     runTest("usable matrix", testUsableMatrix);
     runTest("bad mapping stops the image", testBadMappingStopsTheImage);
+
+    runTest("perfect detections score fully", testPerfectDetectionsScoreFully);
+    runTest("extra and missing balls", testExtraAndMissingBalls);
+    runTest("wrong name still locates ball", testWrongNameStillLocatesBall);
+    runTest("match tolerance is one ball radius", testMatchToleranceIsOneBallRadius);
+    runTest("balls off the table are not counted", testBallsOffTheTableAreNotCounted);
+    runTest("totals add up", testTotalsAddUp);
+    runTest("ground truth balls do not overlap", testGroundTruthBallsDoNotOverlap);
+    runTest("whole run locates balls in every picture", testWholeRunLocatesBallsInEveryPicture);
     cout << "\n" << checkCount << " checks, " << failureCount << " failed" << endl;
     return failureCount == 0 ? 0 : 1;
 }
