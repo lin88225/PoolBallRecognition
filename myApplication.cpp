@@ -608,25 +608,25 @@ Classifier trainClassifier(const vector<BallFeatures>& features) {
     if (!(features[15].outerRingWhiteFraction > mostWhiteOther))
         cout << "cue threshold fell back to default" << endl;
     classifier.cueThreshold = features[15].outerRingWhiteFraction > mostWhiteOther
-        ? sqrt(features[15].outerRingWhiteFraction * mostWhiteOther) : 0.9 * features[15].outerRingWhiteFraction;
+        ? (features[15].outerRingWhiteFraction + mostWhiteOther) / 2 : 0.9 * features[15].outerRingWhiteFraction;
     double mostDarkOther = 0;
     for (int ball = 0; ball < 15; ball++) if (ball != 7) mostDarkOther = max(mostDarkOther, features[ball].darkFraction);
     if (!(features[7].darkFraction > mostDarkOther))
         cout << "black threshold fell back to default" << endl;
     classifier.blackThreshold = features[7].darkFraction > mostDarkOther
-        ? sqrt(features[7].darkFraction * mostDarkOther) : 0.5 * features[7].darkFraction;
+        ? (features[7].darkFraction + mostDarkOther) / 2 : 0.5 * features[7].darkFraction;
     double solidWhite = meanOfFeature(features, 0, 6, &BallFeatures::outerRingWhiteFraction);
     double stripeWhite = meanOfFeature(features, 8, 14, &BallFeatures::outerRingWhiteFraction);
     if (!(stripeWhite > solidWhite))
         cout << "stripe threshold unreliable" << endl;
-    classifier.stripeThreshold = sqrt(solidWhite * stripeWhite);
+    classifier.stripeThreshold = (solidWhite + stripeWhite) / 2;
     for (int ball = 0; ball < 15; ball++) classifier.prototypes[ball] = features[ball];
     return classifier;
 }
 
 // Names a ball. Solids are only compared with solids and stripes with stripes, because a stripe's band
 // blends with white beside it and so looks a little different from solid of same colour
-int classify(const Classifier& classifier, const BallFeatures& features, const bool* taken = nullptr) {
+int classify(const Classifier& classifier, const BallFeatures& features) {
     if (features.outerRingWhiteFraction > classifier.cueThreshold) return 15;
     if (features.darkFraction > classifier.blackThreshold) return 7;
     bool isStripe = features.outerRingWhiteFraction > classifier.stripeThreshold;
@@ -634,7 +634,6 @@ int classify(const Classifier& classifier, const BallFeatures& features, const b
     double bestDistance = 1e18;
     for (int colour = 0; colour < 7; colour++) {
         int ball = isStripe ? colour + 8 : colour;
-        if (taken && taken[ball]) continue;
         double distanceToPrototype = colourDistance(features, classifier.prototypes[ball]);
         if (distanceToPrototype < bestDistance) { bestDistance = distanceToPrototype; bestBall = ball; }
     }
@@ -970,26 +969,6 @@ struct Results {
     int trainingNameCounts[ballCount][ballCount] = {};
 };
 
-// Gives each ball in a picture a different name
-// Balls that look most like their name choose first
-// A ball whose name is already taken moves to its next best name
-void makeNamesUnique(vector<Detection>& detections, const Classifier& classifier) {
-    bool taken[ballCount] = {};
-    vector<int> order;
-    for (int index = 0; index < (int)detections.size(); index++) order.push_back(index);
-    auto distanceToName = [&](int index) {
-        int ball = detections[index].predictedBall;
-        return (ball == 15 || ball == 7) ? 0.0 : colourDistance(detections[index].features, classifier.prototypes[ball]);
-    };
-    sort(order.begin(), order.end(), [&](int first, int second) { return distanceToName(first) < distanceToName(second); });
-    for (int index : order) {
-        Detection& detection = detections[index];
-        if (detection.predictedBall != 15 && detection.predictedBall != 7 && taken[detection.predictedBall])
-            detection.predictedBall = classify(classifier, detection.features, taken);
-        taken[detection.predictedBall] = true;
-    }
-}
-
 // Trains on AllBalls then locates, names and evaluates the balls in every image
 Results analyseAllImages() {
     Results results;
@@ -1031,7 +1010,6 @@ Results analyseAllImages() {
                 detection.features = extractFeatures(analysis, detection.imagePosition, detection.radius, training.whiteSaturationLimit);
                 detection.predictedBall = classify(training.classifier, detection.features);
             }
-            makeNamesUnique(analysis.detections, training.classifier);
             currentStage = "evaluation";
             results.evaluations[image] = evaluate(analysis, image, image == 0 ? results.trainingNameCounts : results.tableNameCounts);
             printImageResults(analysis, results.evaluations[image]);
