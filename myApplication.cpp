@@ -1,6 +1,3 @@
-// myApplication.cpp
-// Pool table assignment, finding and recognising the balls
-
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/filesystem.hpp>
 
