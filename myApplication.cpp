@@ -1013,9 +1013,7 @@ Results analyseAllImages() {
             currentStage = "evaluation";
             results.evaluations[image] = evaluate(analysis, image, image == 0 ? results.trainingNameCounts : results.tableNameCounts);
             printImageResults(analysis, results.evaluations[image]);
-            cout << "DEBUG " << analysis.name << " cloth hue " << analysis.cloth.hue << endl;
             results.overlays[image] = overlayResults(analysis, results.evaluations[image], image);
-            // imshow("overlay", results.overlays[image]);
             if (image > 0) addToTotals(results.totals, results.evaluations[image]);
         } catch (const exception& error) {
             cout << imageNames[image] << " failed at " << currentStage << " (" << error.what() << "), skipped" << endl;
@@ -1035,7 +1033,6 @@ Results analyseAllImages() {
 void MyApplication() {
     if (!utils::fs::createDirectories(outputFolder) && !utils::fs::isDirectory(outputFolder))
         cout << "couldn't make " << outputFolder << endl;
-    // TODO check the folder names work on the lab computers
     Results results = analyseAllImages();
     if (!results.trained) return;
     const Totals& totals = results.totals;
